@@ -36,7 +36,7 @@ Let $d$ be the embedding dimension.
 At time $t$, the full semantic embedding is:
 
 $$
-z_t \in \mathbb R^d,
+z_t \in \mathbb R^{d},
 \qquad
 \|z_t\|_2 = 1.
 $$
@@ -44,7 +44,7 @@ $$
 A retrieval cue is:
 
 $$
-q \in \mathbb R^d,
+q \in \mathbb R^{d},
 \qquad
 \|q\|_2 = 1.
 $$
@@ -87,7 +87,7 @@ It must satisfy:
 $$
 W \succeq 0,
 \qquad
-F = \operatorname{tr}(W) \in [0,1].
+F = \mathrm{tr}(W) \in [0,1].
 $$
 
 Here $F$ is memory fill.
@@ -95,7 +95,7 @@ Here $F$ is memory fill.
 Conceptually:
 
 $$
-W = \sum_i \alpha_i z_i z_i^\top,
+W = \sum_i \alpha_i z_i z_i^{\top},
 $$
 
 with:
@@ -111,7 +111,7 @@ The coefficients $\alpha_i$ are mathematical contributions, not explicit memory 
 Because:
 
 $$
-zz^\top = (-z)(-z)^\top,
+zz^{\top} = (-z)(-z)^{\top},
 $$
 
 the memory is sign-blind. It stores unoriented directions.
@@ -195,7 +195,7 @@ For each input $z_t$:
 $$
 W_t =
 (1-\kappa_t)W_{t-1} +
-\kappa_t z_t z_t^\top.
+\kappa_t z_t z_t^{\top}.
 $$
 
 Fill update:
@@ -209,7 +209,7 @@ $$
 Because $\|z_t\|_2=1$,
 
 $$
-\operatorname{tr}(z_t z_t^\top)=1.
+\mathrm{tr}(z_t z_t^{\top})=1.
 $$
 
 Therefore the fill update is exact.
@@ -278,7 +278,7 @@ Interpretation:
 The directional mass of a stored direction is bounded below by its contribution:
 
 $$
-z_i^\top W_t z_i \ge \alpha_{i,t},
+z_i^{\top} W_t z_i \ge \alpha_{i,t},
 $$
 
 with equality when all other stored directions with nonzero mass are orthogonal to $z_i$.
@@ -364,8 +364,8 @@ The core retrieval energy has no regularizer:
 
 $$
 E(u;q,W) =
--\frac12 u^\top W u -
-\gamma u^\top q,
+-\frac12 u^{\top} W u -
+\gamma u^{\top} q,
 \qquad
 \|u\|_2=1.
 $$
@@ -407,7 +407,7 @@ $$
 Return:
 
 $$
-u^* = u_N.
+u^{*} = u_N.
 $$
 
 Numerical guard. If
@@ -429,7 +429,7 @@ The guard assumes that $q$ and $W$ are finite. If $q$ or $W$ is non-finite, this
 In the core recurrence, the norm-based part of the guard is unreachable in exact finite arithmetic. If $\|u_n\|_2=1$ and $\eta\gamma<1$, then
 
 $$
-\|v_n\|_2 \ge u_n^\top v_n = 1+\eta r_n \ge 1-\eta\gamma,
+\|v_n\|_2 \ge u_n^{\top} v_n = 1+\eta r_n \ge 1-\eta\gamma,
 $$
 
 where $r_n$ is defined in §6.3. Under the recommended bounds,
@@ -457,14 +457,14 @@ Reduce $N$ only after the calibration run (§17.3) shows that retrieval has satu
 Define directional support:
 
 $$
-\mu_n = u_n^\top W u_n.
+\mu_n = u_n^{\top} W u_n.
 $$
 
 Define:
 
 $$
 r_n =
-\mu_n + \gamma u_n^\top q.
+\mu_n + \gamma u_n^{\top} q.
 $$
 
 Then:
@@ -472,7 +472,7 @@ Then:
 $$
 v_n =
 (1+\eta r_n)u_n +
-\eta(I-u_nu_n^\top)(Wu_n+\gamma q).
+\eta(I-u_nu_n^{\top})(Wu_n+\gamma q).
 $$
 
 If:
@@ -493,7 +493,7 @@ Because:
 $$
 \mu_n \ge 0,
 \qquad
-u_n^\top q \ge -1,
+u_n^{\top} q \ge -1,
 $$
 
 we have:
@@ -524,10 +524,10 @@ So the recommended bound $\eta_{\max}\gamma_{\max}<1$ prevents radial sign flips
 
 Remarks:
 
-- $\eta\gamma<1$ is sufficient, not necessary. What the recurrence needs is $1+\eta r_n>0$. Since $r_n \ge \gamma u_n^\top q$, if $\eta\gamma>0$, this condition holds whenever
+- $\eta\gamma<1$ is sufficient, not necessary. What the recurrence needs is $1+\eta r_n>0$. Since $r_n \ge \gamma u_n^{\top} q$, if $\eta\gamma>0$, this condition holds whenever
 
 $$
-  u_n^\top q > -\frac{1}{\eta\gamma}.
+  u_n^{\top} q > -\frac{1}{\eta\gamma}.
 $$
 
   If $\gamma=0$, the condition is automatic because $r_n=\mu_n\ge0$. The bound $\eta\gamma<1$ is conservative and ties $\gamma_{\max}$ to $\eta_{\max}$.
@@ -543,7 +543,7 @@ $$
 - The smooth part of the energy,
 
 $$
-  -\frac12 u^\top W u-\gamma u^\top q,
+  -\frac12 u^{\top} W u-\gamma u^{\top} q,
 $$
 
   is concave in $u$, because its Hessian is $-W \preceq 0$. Without the sphere constraint, minimizing it would be unbounded below, and the plain step would grow like a power iteration. Normalization is what makes retrieval well-posed, and standard proximal-gradient theory does not apply.
@@ -565,7 +565,7 @@ $$
 $$
 
 $$
-\mu_n = u_n^\top W u_n,
+\mu_n = u_n^{\top} W u_n,
 $$
 
 $$
@@ -595,10 +595,10 @@ This section explains the current bounds and gives the check to run before train
 Setup. Let $z$ be a stored direction with mass
 
 $$
-m = z^\top W z,
+m = z^{\top} W z,
 $$
 
-and suppose $W \approx m\,zz^\top$ over the relevant subspace. Let the cue $q$ sit at a small angle $\varphi$ from $z$, and let $\psi_n$ be the angle $u_n$ has moved from $q$ toward $z$. To first order in small angles:
+and suppose $W \approx m\,zz^{\top}$ over the relevant subspace. Let the cue $q$ sit at a small angle $\varphi$ from $z$, and let $\psi_n$ be the angle $u_n$ has moved from $q$ toward $z$. To first order in small angles:
 
 $$
 \psi_{n+1}
@@ -612,18 +612,18 @@ $$
 Hence:
 
 $$
-\psi^*=\frac{m}{m+\gamma}\,\varphi,
+\psi^{*}=\frac{m}{m+\gamma}\,\varphi,
 \qquad
 \rho = h(m+\gamma),
 \qquad
-\psi_N \approx \left(1-e^{-\rho N}\right)\psi^*.
+\psi_N \approx \left(1-e^{-\rho N}\right)\psi^{*}.
 $$
 
-Here $\psi^*$ is the equilibrium and $\rho$ is the per-step relaxation rate.
+Here $\psi^{*}$ is the equilibrium and $\rho$ is the per-step relaxation rate.
 
 Consequences:
 
-1. **$\gamma$ competes with $m$.** If $\gamma\gg m$, then $\psi^*\approx (m/\gamma)\varphi$ and retrieval stays near $q$. $\gamma$ should live at the scale of the item masses it is meant to retrieve.
+1. **$\gamma$ competes with $m$.** If $\gamma\gg m$, then $\psi^{*}\approx (m/\gamma)\varphi$ and retrieval stays near $q$. $\gamma$ should live at the scale of the item masses it is meant to retrieve.
 2. **Gain requires $\rho N \gtrsim 1$.** Use the smallest mass you expect to retrieve, for example $m\approx 0.01$ for older items.
 3. **Mass scale.** $m \ge \alpha_{i,t}$ (§4.4). Under (A1), the largest contribution of a freshly written item is $\alpha=\kappa_{\max}/2$, which is $0.05$ at the default $\kappa_{\max}=0.1$.
 
@@ -650,7 +650,7 @@ Because the memory is sign-blind, the primary loss is sign-blind.
 For a target embedding:
 
 $$
-z_{\mathrm{target}} \in \mathbb R^d,
+z_{\mathrm{target}} \in \mathbb R^{d},
 \qquad
 \|z_{\mathrm{target}}\|_2=1,
 $$
@@ -666,17 +666,17 @@ Equivalently:
 
 $$
 L_{\mathrm{retrieval}} =
-1 - |\cos(u^*, z_{\mathrm{target}})|.
+1 - |\cos(u^{*}, z_{\mathrm{target}})|.
 $$
 
-This loss treats $u^*$ and $-u^*$ as equivalent, which matches the memory operator. Unlike $1-\cos^2$, its gradient does not vanish when $u^*\perp z_{\mathrm{target}}$: the gradient of $1-\cos^2$ with respect to $u$ is proportional to $\cos(u^*,z_{\mathrm{target}})$, so it gives little signal exactly when retrieval is far from the target.
+This loss treats $u^{*}$ and $-u^{*}$ as equivalent, which matches the memory operator. Unlike $1-\cos^{2}$, its gradient does not vanish when $u^{*}\perp z_{\mathrm{target}}$: the gradient of $1-\cos^{2}$ with respect to $u$ is proportional to $\cos(u^{*},z_{\mathrm{target}})$, so it gives little signal exactly when retrieval is far from the target.
 
 The absolute-value loss is nondifferentiable at $\cos=0$. This is usually acceptable as a measure-zero event, and a subgradient can be used.
 
 If a differentiable surrogate is required, first clamp the cosine:
 
 $$
-c = \operatorname{clip}\left(u^{*\top}z_{\mathrm{target}}, -1, 1\right).
+c = \mathrm{clip}\left(u^{*\top}z_{\mathrm{target}}, -1, 1\right).
 $$
 
 Then use:
@@ -684,7 +684,7 @@ Then use:
 $$
 L_{\mathrm{smooth\text{-}abs}} =
 \sqrt{1+\epsilon_L} -
-\sqrt{c^2+\epsilon_L}.
+\sqrt{c^{2}+\epsilon_L}.
 $$
 
 Recommended initial value:
@@ -696,7 +696,7 @@ $$
 This surrogate is nonnegative for $|c|\le1$, and it is exactly zero at perfect retrieval, $|c|=1$. Its gradient with respect to $c$ is:
 
 $$
--\frac{c}{\sqrt{c^2+\epsilon_L}}.
+-\frac{c}{\sqrt{c^{2}+\epsilon_L}}.
 $$
 
 Therefore it approximates the subgradient of $1-|c|$ when $|c|\gg \sqrt{\epsilon_L}$, but its gradient vanishes at $c=0$. The signal is weakened for
@@ -712,20 +712,20 @@ Ablations:
 - absolute sign-blind loss:
 
 $$
-  1-|\cos(u^*,z_{\mathrm{target}})|,
+  1-|\cos(u^{*},z_{\mathrm{target}})|,
 $$
 
 - smooth sign-blind surrogate:
 
 $$
   \sqrt{1+\epsilon_L} -
-  \sqrt{(u^{*\top}z_{\mathrm{target}})^2+\epsilon_L},
+  \sqrt{(u^{*\top}z_{\mathrm{target}})^{2}+\epsilon_L},
 $$
 
 - smooth quadratic sign-blind loss:
 
 $$
-  1-\cos^2(u^*,z_{\mathrm{target}}),
+  1-\cos^{2}(u^{*},z_{\mathrm{target}}),
 $$
 
 - oriented loss:
@@ -736,10 +736,10 @@ $$
 
   only if the cue reliably determines the target sign.
 
-Reference value. The cue-only baseline $u^*=q$, equivalent to $N=0$, has loss
+Reference value. The cue-only baseline $u^{*}=q$, equivalent to $N=0$, has loss
 
 $$
-1-|q^\top z_{\mathrm{target}}|.
+1-|q^{\top} z_{\mathrm{target}}|.
 $$
 
 Learned retrieval must beat it; see §17.1.
@@ -799,8 +799,8 @@ If enabled, the energy becomes:
 
 $$
 E_\lambda(u;q,W) =
--\frac12 u^\top W u -
-\gamma u^\top q +
+-\frac12 u^{\top} W u -
+\gamma u^{\top} q +
 \lambda \|u\|_1,
 $$
 
@@ -830,7 +830,7 @@ q,
 \|\widetilde u_{n+1}\|_2 < \epsilon_{\mathrm{fall}}
 \ \text{or}\
 \widetilde u_{n+1}\ \text{non-finite},
-\\[6pt]
+\\
 \dfrac{\widetilde u_{n+1}}{\|\widetilde u_{n+1}\|_2},
 &
 \text{otherwise}.
@@ -851,7 +851,7 @@ $$
 \widetilde u_{n+1}=v_n.
 $$
 
-Do not approximate $\lambda=0$ by applying the smooth operator with a very small $\lambda$. Use an explicit off-switch. If $\lambda=\operatorname{softplus}(a_\lambda)$ is learned, it is strictly positive for finite parameters, so keep a separate shrinkage flag.
+Do not approximate $\lambda=0$ by applying the smooth operator with a very small $\lambda$. Use an explicit off-switch. If $\lambda=\mathrm{softplus}(a_\lambda)$ is learned, it is strictly positive for finite parameters, so keep a separate shrinkage flag.
 
 Scale of the threshold. A typical coordinate of a dense unit vector in $\mathbb R^{384}$ has magnitude about
 
@@ -881,7 +881,7 @@ The exact soft-threshold operator is:
 
 $$
 S_a(v)_j =
-\operatorname{sign}(v_j)
+\mathrm{sign}(v_j)
 \max(|v_j|-a,0).
 $$
 
@@ -901,14 +901,14 @@ For differentiable training, use the centered smooth soft-threshold:
 
 $$
 S_{a,\tau}(v)_j =
-\operatorname{sign}(v_j)
+\mathrm{sign}(v_j)
 \tau
 \left[
-\operatorname{softplus}
+\mathrm{softplus}
 \left(
 \frac{|v_j|-a}{\tau}
 \right) -
-\operatorname{softplus}
+\mathrm{softplus}
 \left(
 -\frac{a}{\tau}
 \right)
@@ -929,18 +929,18 @@ $$
 S_{a,\tau}(0)=0,
 $$
 
-is continuous, is $C^1$, and has derivative at zero
+is continuous, is $C^{1}$, and has derivative at zero
 
 $$
 \sigma(-a/\tau)
 $$
 
-from both sides. It is not $C^2$.
+from both sides. It is not $C^{2}$.
 
 Implementation note: autograd through
 
 $$
-\operatorname{sign}(v_j)\,g(|v_j|)
+\mathrm{sign}(v_j)\,g(|v_j|)
 $$
 
 usually returns gradient 0 at exactly $v_j=0$, not $\sigma(-a/\tau)$. Use a custom derivative or a safe factorized form if exact zeros can occur.
@@ -950,7 +950,7 @@ As $\tau\to0$, it approaches exact soft-thresholding:
 $$
 S_{a,\tau}(v)_j
 \to
-\operatorname{sign}(v_j)
+\mathrm{sign}(v_j)
 \max(|v_j|-a,0).
 $$
 
@@ -964,10 +964,10 @@ Initially, keep $\tau$ fixed. If shrinkage is learned, learn only $\lambda$ firs
 
 Reinforcement writes a retrieved direction back into memory. It should be enabled only after basic retrieval is reliable.
 
-Given a retrieved state $u^*$, compute directional support:
+Given a retrieved state $u^{*}$, compute directional support:
 
 $$
-\mu = {u^*}^\top W u^*.
+\mu = {u^{*}}^{\top} W u^{*}.
 $$
 
 This satisfies:
@@ -1056,7 +1056,7 @@ $$
 W
 \leftarrow
 (1-\beta)W +
-\beta u^*{u^*}^\top.
+\beta u^{*}{u^{*}}^{\top}.
 $$
 
 Fill update:
@@ -1098,10 +1098,10 @@ Define retrieval features:
 $$
 r =
 [
-u^*,
+u^{*},
 q,
-u^* \odot q,
-E(u^*),
+u^{*} \odot q,
+E(u^{*}),
 \mu,
 F,
 \text{fallback flag}
@@ -1151,7 +1151,7 @@ When the raw output norm is below the floor, $\hat z$ has norm below 1. This is 
 Normalization, or norm-clipped normalization, is required. For an unnormalized output, a squared-overlap loss such as
 
 $$
-1-(\hat z^\top z_{\mathrm{target}})^2
+1-(\hat z^{\top} z_{\mathrm{target}})^{2}
 $$
 
 is unbounded below, because it can be driven down by growing $\|\hat z\|$.
@@ -1167,7 +1167,7 @@ If a fully smooth decoder normalization is desired, use instead:
 $$
 \hat z_{\mathrm{smooth}} =
 \frac{D_\psi(r)}
-{\sqrt{\|D_\psi(r)\|_2^2+\epsilon_{\mathrm{dec}}^2}}.
+{\sqrt{\|D_\psi(r)\|_2^{2}+\epsilon_{\mathrm{dec}}^{2}}}.
 $$
 
 This variant satisfies:
@@ -1182,7 +1182,7 @@ $$
 \|D_\psi(r)\|_2 \gg \epsilon_{\mathrm{dec}}.
 $$
 
-Because the smooth decoder output is strictly subunit for finite raw outputs, it can never produce an exactly zero oriented reconstruction loss: for any target, $L_{\mathrm{meaning}}=1-\hat z^\top z_{\mathrm{target}}\ge 1-\|\hat z\|_2>0$. For example, if
+Because the smooth decoder output is strictly subunit for finite raw outputs, it can never produce an exactly zero oriented reconstruction loss: for any target, $L_{\mathrm{meaning}}=1-\hat z^{\top} z_{\mathrm{target}}\ge 1-\|\hat z\|_2>0$. For example, if
 
 $$
 D_\psi(r)=\alpha z_{\mathrm{target}},
@@ -1194,10 +1194,10 @@ then max-floor normalization gives exact zero loss whenever $\alpha\ge\epsilon_{
 
 $$
 L_{\mathrm{meaning}} =
-1-\frac{\alpha}{\sqrt{\alpha^2+\epsilon_{\mathrm{dec}}^2}},
+1-\frac{\alpha}{\sqrt{\alpha^{2}+\epsilon_{\mathrm{dec}}^{2}}},
 $$
 
-which approaches zero only as $\alpha\to\infty$. In practice, with $\epsilon_{\mathrm{dec}}=10^{-6}$ and decoder outputs of ordinary magnitude, this difference is tiny. When evaluated naively as $1-\hat z^\top z_{\mathrm{target}}$ in float32, the smooth loss rounds to zero once $\|D_\psi(r)\|_2$ exceeds roughly $10^{4}\epsilon_{\mathrm{dec}}$, which is $10^{-2}$ at the default. A numerically stable evaluation can retain a tiny positive loss. Under naive evaluation, therefore, the choice between the two normalizations matters only in exact arithmetic or near the floor. If exact zero loss or exact unit-norm outputs are required for finite decoder outputs, prefer max-floor normalization.
+which approaches zero only as $\alpha\to\infty$. In practice, with $\epsilon_{\mathrm{dec}}=10^{-6}$ and decoder outputs of ordinary magnitude, this difference is tiny. When evaluated naively as $1-\hat z^{\top} z_{\mathrm{target}}$ in float32, the smooth loss rounds to zero once $\|D_\psi(r)\|_2$ exceeds roughly $10^{4}\epsilon_{\mathrm{dec}}$, which is $10^{-2}$ at the default. A numerically stable evaluation can retain a tiny positive loss. Under naive evaluation, therefore, the choice between the two normalizations matters only in exact arithmetic or near the floor. If exact zero loss or exact unit-norm outputs are required for finite decoder outputs, prefer max-floor normalization.
 
 Gradient scale. The Jacobian of the decoder normalization has spectral norm
 
@@ -1209,7 +1209,7 @@ $$
 away from the kink, and
 
 $$
-\frac{1}{\sqrt{\|D_\psi(r)\|_2^2+\epsilon_{\mathrm{dec}}^2}}
+\frac{1}{\sqrt{\|D_\psi(r)\|_2^{2}+\epsilon_{\mathrm{dec}}^{2}}}
 \quad\text{(smooth)}.
 $$
 
@@ -1219,7 +1219,7 @@ $$
 \frac{1}{\epsilon_{\mathrm{dec}}}.
 $$
 
-At the default $\epsilon_{\mathrm{dec}}=10^{-6}$, this bound is $10^6$. At $\epsilon_{\mathrm{dec}}=10^{-4}$, it is $10^4$.
+At the default $\epsilon_{\mathrm{dec}}=10^{-6}$, this bound is $10^{6}$. At $\epsilon_{\mathrm{dec}}=10^{-4}$, it is $10^{4}$.
 
 The decoder floor is a separate constant from $\epsilon_{\mathrm{fall}}$. The retrieval guard can use $10^{-8}$ because $\|v_n\|_2\ge 1/2$ in the core recurrence. A decoder's raw output is not so constrained, and a floor of $10^{-6}$ to $10^{-4}$ costs little when trained outputs are typically much larger.
 
@@ -1229,7 +1229,7 @@ Default semantic reconstruction loss:
 
 $$
 L_{\mathrm{meaning}} =
-1 - \hat z^\top z_{\mathrm{target}}.
+1 - \hat z^{\top} z_{\mathrm{target}}.
 $$
 
 This is oriented on purpose. The decoder sees $q$, which can supply orientation, and downstream use of embeddings is often oriented. Discarding sign would lose information that the decoder can in principle recover from the cue.
@@ -1238,13 +1238,13 @@ If the cues do not reliably carry orientation, use the sign-blind variant:
 
 $$
 L_{\mathrm{meaning}}^{\mathrm{blind}} =
-1 - \left|\hat z^\top z_{\mathrm{target}}\right|.
+1 - \left|\hat z^{\top} z_{\mathrm{target}}\right|.
 $$
 
 A smooth sign-blind decoder loss can use the surrogate of §7 with
 
 $$
-c=\operatorname{clip}\left(\hat z^\top z_{\mathrm{target}},-1,1\right).
+c=\mathrm{clip}\left(\hat z^{\top} z_{\mathrm{target}},-1,1\right).
 $$
 
 Because $\|\hat z\|_2$ may be below 1, this $c$ is a clamped inner product, not necessarily a true cosine. If $\|\hat z\|_2<1$, then $|c|<1$ even when the direction is perfect, so the smooth surrogate cannot reach exactly zero. This happens under the smooth denominator for finite outputs, and under max-floor normalization when $\|D_\psi(r)\|_2<\epsilon_{\mathrm{dec}}$. Under max-floor normalization with $\|D_\psi(r)\|_2\ge\epsilon_{\mathrm{dec}}$, $\|\hat z\|_2=1$ and the surrogate reaches exactly zero at perfect direction. The loss therefore penalizes subunit decoder outputs.
@@ -1267,14 +1267,14 @@ $$
 Then:
 
 $$
-\operatorname{tr}(\widetilde W)=1.
+\mathrm{tr}(\widetilde W)=1.
 $$
 
 For unit $u$,
 
 $$
-u^\top \widetilde W u =
-u^\top W u +
+u^{\top} \widetilde W u =
+u^{\top} W u +
 \frac{1-F}{d}.
 $$
 
@@ -1326,8 +1326,8 @@ Use $W$, not $\widetilde W$, for reinforcement and directional support unless yo
 For any unit state $u$,
 
 $$
-u^\top W u =
-\sum_i \alpha_i (z_i^\top u)^2.
+u^{\top} W u =
+\sum_i \alpha_i (z_i^{\top} u)^{2}.
 $$
 
 If several stored directions overlap with $u$, they can jointly support it.
@@ -1336,14 +1336,14 @@ For example:
 
 $$
 W =
-\frac12 z_1z_1^\top +
-\frac12 z_2z_2^\top.
+\frac12 z_1z_1^{\top} +
+\frac12 z_2z_2^{\top}.
 $$
 
 Let:
 
 $$
-\omega = z_1^\top z_2.
+\omega = z_1^{\top} z_2.
 $$
 
 In the span of $z_1,z_2$, the eigenvalues are:
@@ -1469,13 +1469,13 @@ $$
 4. Symmetrize $W$ after updates:
 
 $$
-   W \leftarrow \frac{W+W^\top}{2}.
+   W \leftarrow \frac{W+W^{\top}}{2}.
 $$
 
 5. Keep $F$ consistent:
 
 $$
-   F = \operatorname{tr}(W).
+   F = \mathrm{tr}(W).
 $$
 
    If numerical drift appears, recompute $F$ from the trace.
@@ -1504,16 +1504,16 @@ For dense $W\in\mathbb R^{d\times d}$:
 
 | Operation | Complexity |
 |---|---:|
-| Store $W$ | $O(d^2)$ |
-| Write one item | $O(d^2)$ |
-| Compute $Wu$ | $O(d^2)$ |
-| One retrieval iteration | $O(d^2)$ |
-| Full eigendecomposition | $O(d^3)$ |
+| Store $W$ | $O(d^{2})$ |
+| Write one item | $O(d^{2})$ |
+| Compute $Wu$ | $O(d^{2})$ |
+| One retrieval iteration | $O(d^{2})$ |
+| Full eigendecomposition | $O(d^{3})$ |
 
 For $d=384$:
 
 $$
-d^2 = 147{,}456.
+d^{2} = 147{,}456.
 $$
 
 This is practical for a dense first implementation. Backpropagation through $N$ retrieval iterations and the write sequence adds memory proportional to the number of stored intermediate states.
@@ -1528,7 +1528,7 @@ The first experiment should focus on writing, retrieval, and learning the global
 
 Compare the proposed memory against:
 
-0. **Cue-only retrieval, $u^*=q$, equivalent to $N=0$.** This is the floor: if the memory does not beat it, retrieval is not using the memory.
+0. **Cue-only retrieval, $u^{*}=q$, equivalent to $N=0$.** This is the floor: if the memory does not beat it, retrieval is not using the memory.
 1. Nearest-neighbor retrieval over stored embeddings. This baseline stores explicit records.
 2. A simple linear-memory baseline.
 3. Constant write rate versus importance-dependent write rate.
@@ -1576,7 +1576,7 @@ If retrieval is close to the identity in every bucket, raise $\eta_{\max}$ or $N
 | Half-saturation constant | $c=1$ fixed, $c$ learned |
 | Parameter optimization | Fixed parameters, learned global parameters |
 | Training schedule | $\kappa_{\max}$ frozen then unfrozen (§8), joint from the start |
-| Retrieval loss | $1-\lvert\cos\rvert$, smooth $\lvert\cos\rvert$ surrogate, $1-\cos^2$, oriented $1-\cos$ |
+| Retrieval loss | $1-\lvert\cos\rvert$, smooth $\lvert\cos\rvert$ surrogate, $1-\cos^{2}$, oriented $1-\cos$ |
 | Shrinkage | None, exact soft-threshold, centered smooth soft-threshold, sigmoid gate |
 | Reinforcement | Disabled, enabled |
 | Decoder normalization | Max-floor norm clipping, smooth denominator |
@@ -1587,7 +1587,7 @@ Record:
 
 - retrieval energy $E(u_n;q,W)$,
 - state change $\|u_{n+1}-u_n\|_2$,
-- directional support $u_n^\top W u_n$,
+- directional support $u_n^{\top} W u_n$,
 - guard count in the core, or fallback frequency with shrinkage,
 - memory fill $F$,
 - learned parameter values and cap saturation,
@@ -1623,7 +1623,7 @@ $$
 $$
 W_t =
 (1-\kappa_t)W_{t-1} +
-\kappa_t z_tz_t^\top
+\kappa_t z_tz_t^{\top}
 $$
 
 $$
@@ -1652,7 +1652,7 @@ u_{n+1} =
 $$
 
 $$
-u^* = u_N
+u^{*} = u_N
 $$
 
 with the numerical guard
@@ -1701,7 +1701,7 @@ in two stages:
 ### Optional reinforce
 
 $$
-\mu = {u^*}^\top W u^*
+\mu = {u^{*}}^{\top} W u^{*}
 $$
 
 $$
@@ -1726,7 +1726,7 @@ $$
 W
 \leftarrow
 (1-\beta)W +
-\beta u^*{u^*}^\top
+\beta u^{*}{u^{*}}^{\top}
 $$
 
 $$
@@ -1745,7 +1745,7 @@ Version 1.9 tests whether a fixed-size PSD second-moment memory, with simple imp
 The first experiment should show:
 
 1. The second-moment memory retains useful semantic direction.
-2. Partial cues retrieve useful directions beyond the cue-only baseline $u^*=q$.
+2. Partial cues retrieve useful directions beyond the cue-only baseline $u^{*}=q$.
 3. Learned $\{\kappa_{\max},\eta,\gamma\}$ improve over fixed manually chosen values.
 
 Only after that should the system add:
