@@ -1,4 +1,4 @@
-HopMem is a fixed-size semantic associative memory module for language models. It maintains a symmetric positive-semidefinite fast-weight matrix with bounded trace, writing normalized semantic embeddings using importance-weighted mass and multiplicative forgetting. Retrieval is performed via sparse, energy-inspired attractor dynamics on the unit sphere, which resolve overlapping traces into distinct semantic states. A confidence-gated reinforcement mechanism consolidates successfully retrieved directions, allowing recent or frequently cued memories to remain detailed while uncued older traces compress into aggregate background structure.
+# HopMem is a fixed-size semantic associative memory module for language models. It maintains a symmetric positive-semidefinite fast-weight matrix with bounded trace, writing normalized semantic embeddings using importance-weighted mass and multiplicative forgetting. Retrieval is performed via sparse, energy-inspired attractor dynamics on the unit sphere, which resolve overlapping traces into distinct semantic states. A confidence-gated reinforcement mechanism consolidates successfully retrieved directions, allowing recent or frequently cued memories to remain detailed while uncued older traces compress into aggregate background structure.
 
 # Frozen Specification v1.9  
 ## Simple Fixed-Size Priority-Weighted Semantic Associative Memory
@@ -407,7 +407,7 @@ $$
 Return:
 
 $$
-u^{*} = u_N.
+u^{\ast} = u_N.
 $$
 
 Numerical guard. If
@@ -612,18 +612,18 @@ $$
 Hence:
 
 $$
-\psi^{*}=\frac{m}{m+\gamma}\,\varphi,
+\psi^{\ast}=\frac{m}{m+\gamma}\,\varphi,
 \qquad
 \rho = h(m+\gamma),
 \qquad
-\psi_N \approx \left(1-e^{-\rho N}\right)\psi^{*}.
+\psi_N \approx \left(1-e^{-\rho N}\right)\psi^{\ast}.
 $$
 
-Here $\psi^{*}$ is the equilibrium and $\rho$ is the per-step relaxation rate.
+Here $\psi^{\ast}$ is the equilibrium and $\rho$ is the per-step relaxation rate.
 
 Consequences:
 
-1. **$\gamma$ competes with $m$.** If $\gamma\gg m$, then $\psi^{*}\approx (m/\gamma)\varphi$ and retrieval stays near $q$. $\gamma$ should live at the scale of the item masses it is meant to retrieve.
+1. **$\gamma$ competes with $m$.** If $\gamma\gg m$, then $\psi^{\ast}\approx (m/\gamma)\varphi$ and retrieval stays near $q$. $\gamma$ should live at the scale of the item masses it is meant to retrieve.
 2. **Gain requires $\rho N \gtrsim 1$.** Use the smallest mass you expect to retrieve, for example $m\approx 0.01$ for older items.
 3. **Mass scale.** $m \ge \alpha_{i,t}$ (§4.4). Under (A1), the largest contribution of a freshly written item is $\alpha=\kappa_{\max}/2$, which is $0.05$ at the default $\kappa_{\max}=0.1$.
 
@@ -659,24 +659,24 @@ define:
 
 $$
 L_{\mathrm{retrieval}} =
-1 - \left|u^{*\top} z_{\mathrm{target}}\right|.
+1 - \left|u^{\ast\top} z_{\mathrm{target}}\right|.
 $$
 
 Equivalently:
 
 $$
 L_{\mathrm{retrieval}} =
-1 - |\cos(u^{*}, z_{\mathrm{target}})|.
+1 - |\cos(u^{\ast}, z_{\mathrm{target}})|.
 $$
 
-This loss treats $u^{*}$ and $-u^{*}$ as equivalent, which matches the memory operator. Unlike $1-\cos^{2}$, its gradient does not vanish when $u^{*}\perp z_{\mathrm{target}}$: the gradient of $1-\cos^{2}$ with respect to $u$ is proportional to $\cos(u^{*},z_{\mathrm{target}})$, so it gives little signal exactly when retrieval is far from the target.
+This loss treats $u^{\ast}$ and $-u^{\ast}$ as equivalent, which matches the memory operator. Unlike $1-\cos^{2}$, its gradient does not vanish when $u^{\ast}\perp z_{\mathrm{target}}$: the gradient of $1-\cos^{2}$ with respect to $u$ is proportional to $\cos(u^{\ast},z_{\mathrm{target}})$, so it gives little signal exactly when retrieval is far from the target.
 
 The absolute-value loss is nondifferentiable at $\cos=0$. This is usually acceptable as a measure-zero event, and a subgradient can be used.
 
 If a differentiable surrogate is required, first clamp the cosine:
 
 $$
-c = \mathrm{clip}\left(u^{*\top}z_{\mathrm{target}}, -1, 1\right).
+c = \mathrm{clip}\left(u^{\ast\top}z_{\mathrm{target}}, -1, 1\right).
 $$
 
 Then use:
@@ -712,31 +712,31 @@ Ablations:
 - absolute sign-blind loss:
 
 $$
-  1-|\cos(u^{*},z_{\mathrm{target}})|,
+  1-|\cos(u^{\ast},z_{\mathrm{target}})|,
 $$
 
 - smooth sign-blind surrogate:
 
 $$
   \sqrt{1+\epsilon_L} -
-  \sqrt{(u^{*\top}z_{\mathrm{target}})^{2}+\epsilon_L},
+  \sqrt{(u^{\ast\top}z_{\mathrm{target}})^{2}+\epsilon_L},
 $$
 
 - smooth quadratic sign-blind loss:
 
 $$
-  1-\cos^{2}(u^{*},z_{\mathrm{target}}),
+  1-\cos^{2}(u^{\ast},z_{\mathrm{target}}),
 $$
 
 - oriented loss:
 
 $$
-  1-u^{*\top}z_{\mathrm{target}},
+  1-u^{\ast\top}z_{\mathrm{target}},
 $$
 
   only if the cue reliably determines the target sign.
 
-Reference value. The cue-only baseline $u^{*}=q$, equivalent to $N=0$, has loss
+Reference value. The cue-only baseline $u^{\ast}=q$, equivalent to $N=0$, has loss
 
 $$
 1-|q^{\top} z_{\mathrm{target}}|.
@@ -964,10 +964,10 @@ Initially, keep $\tau$ fixed. If shrinkage is learned, learn only $\lambda$ firs
 
 Reinforcement writes a retrieved direction back into memory. It should be enabled only after basic retrieval is reliable.
 
-Given a retrieved state $u^{*}$, compute directional support:
+Given a retrieved state $u^{\ast}$, compute directional support:
 
 $$
-\mu = u^{*\top} W u^{*}.
+\mu = {u^{\ast}}^{\top} W u^{\ast}.
 $$
 
 This satisfies:
@@ -1056,7 +1056,7 @@ $$
 W
 \leftarrow
 (1-\beta)W +
-\beta\, u^{*} u^{*\top}.
+\beta\, u^{\ast}{u^{\ast}}^{\top}.
 $$
 
 Fill update:
@@ -1098,10 +1098,10 @@ Define retrieval features:
 $$
 r =
 [
-u^{*},
+u^{\ast},
 q,
-u^{*} \odot q,
-E(u^{*}),
+u^{\ast} \odot q,
+E(u^{\ast}),
 \mu,
 F,
 \text{fallback flag}
@@ -1528,7 +1528,7 @@ The first experiment should focus on writing, retrieval, and learning the global
 
 Compare the proposed memory against:
 
-0. **Cue-only retrieval, $u^{*}=q$, equivalent to $N=0$.** This is the floor: if the memory does not beat it, retrieval is not using the memory.
+0. **Cue-only retrieval, $u^{\ast}=q$, equivalent to $N=0$.** This is the floor: if the memory does not beat it, retrieval is not using the memory.
 1. Nearest-neighbor retrieval over stored embeddings. This baseline stores explicit records.
 2. A simple linear-memory baseline.
 3. Constant write rate versus importance-dependent write rate.
@@ -1652,7 +1652,7 @@ u_{n+1} =
 $$
 
 $$
-u^{*} = u_N
+u^{\ast} = u_N
 $$
 
 with the numerical guard
@@ -1682,7 +1682,7 @@ $$
 
 $$
 L =
-1 - \left|u^{*\top}z_{\mathrm{target}}\right|
+1 - \left|u^{\ast\top}z_{\mathrm{target}}\right|
 $$
 
 Learn:
@@ -1701,7 +1701,7 @@ in two stages:
 ### Optional reinforce
 
 $$
-\mu = u^{*\top} W u^{*}
+\mu = {u^{\ast}}^{\top} W u^{\ast}
 $$
 
 $$
@@ -1726,7 +1726,7 @@ $$
 W
 \leftarrow
 (1-\beta)W +
-\beta\, u^{*} u^{*\top}
+\beta\, u^{\ast}{u^{\ast}}^{\top}
 $$
 
 $$
@@ -1745,7 +1745,7 @@ Version 1.9 tests whether a fixed-size PSD second-moment memory, with simple imp
 The first experiment should show:
 
 1. The second-moment memory retains useful semantic direction.
-2. Partial cues retrieve useful directions beyond the cue-only baseline $u^{*}=q$.
+2. Partial cues retrieve useful directions beyond the cue-only baseline $u^{\ast}=q$.
 3. Learned $\{\kappa_{\max},\eta,\gamma\}$ improve over fixed manually chosen values.
 
 Only after that should the system add:
