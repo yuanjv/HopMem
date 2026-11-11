@@ -967,7 +967,7 @@ Reinforcement writes a retrieved direction back into memory. It should be enable
 Given a retrieved state $u^{*}$, compute directional support:
 
 $$
-\mu = {u^{*}}^{\top} W u^{*}.
+\mu = u^{*\top} W u^{*}.
 $$
 
 This satisfies:
@@ -1056,7 +1056,7 @@ $$
 W
 \leftarrow
 (1-\beta)W +
-\beta u^{*}{u^{*}}^{\top}.
+\beta\, u^{*} u^{*\top}.
 $$
 
 Fill update:
@@ -1701,7 +1701,7 @@ in two stages:
 ### Optional reinforce
 
 $$
-\mu = {u^{*}}^{\top} W u^{*}
+\mu = u^{*\top} W u^{*}
 $$
 
 $$
@@ -1726,7 +1726,7 @@ $$
 W
 \leftarrow
 (1-\beta)W +
-\beta u^{*}{u^{*}}^{\top}
+\beta\, u^{*} u^{*\top}
 $$
 
 $$
