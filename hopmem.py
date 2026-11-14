@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-HopMem v3.6 -- dose-weighted associative memory with a Gibbs (log-sum-exp) readout.
+HopMem v2.1.1 -- dose-weighted associative memory with a Gibbs (log-sum-exp) readout.
 
     python hopmem.py selftest
     python hopmem.py calibrate --read gibbs
