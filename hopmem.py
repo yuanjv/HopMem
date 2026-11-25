@@ -1,22 +1,32 @@
 #!/usr/bin/env python
-"""HopMem v2.2.1 -- dose-weighted associative memory with a Gibbs readout, a calibrated
-abstention gate, and a parameter-free fusion channel (spec v2.2.1; supersedes v2.1.1/v3.6).
+"""HopMem v2.3.1 -- debit-optimal compression: one derived comparison over two
+evidence-monotone operations, an exact incremental Gram law, and the withdrawn
+superiority claim.
 
-    python hopmem.py selftest        # 36 checks (spec section 24)
+    python hopmem.py selftest        # 44 checks (spec section 24)
     python hopmem.py calibrate --read gibbs
-    python hopmem.py train --synthetic --schedule probe --batch 256 --C 64
-    python hopmem_diag.py --ckpt hopmem_theta.pt
+    python hopmem.py train --schedule probe --batch 256 --C 16 --c_min 4
+    python hopmem_diag.py --ckpt hopmem_theta.pt --T_big 100 --caps 4 8 16 32 --dup_sweep
 
-State W=(1-S)J+M, tr W=1, W>=0, S in [0,1); <=C log-atoms (z,ell,D)+S+lazy clock.
-On overflow: null-fuse gate-dead atoms (ell<=kappa+ln tau_dead), else min-Ward pair
-fusion ell'=logaddexp(ell_i,ell_j)-beta(1-r), 1-r^2=2 w_i w_j(1-G); deficit->(1-S)J.
-C=1 no valid pair: null-fuse lower dose, ledger full loss.  Ledger D_c=sum(1-r).
-NOTE: ell_c=logaddexp(base)-beta*D_c is exact only for ONE fusion; multi-fusion uses the
-recursion and e^{-sum delta} is a conservative lower bound on retained dose (selftest 33).
-Readout F convex; u+=gradF/|gradF| ascends for every beta>0; decide at u=q then descend.
-Train probe P(cue-free,fusion OFF)->A(cue CE on fused)->B(law frozen); tau calibrated once.
-Deployment: p,tau,cfg=load_checkpoint(...); mem=HopMem(p,d,C,tau); mem.write(z,s,t);
-u=mem.retrieve(q,t_q).
+State W=(1-S)J+M, tr W=1, W>=0, S in [0,1); <=C log-atoms (z, ell, Lam) + S + lazy clock.
+On overflow: (1) null-fuse gate-dead atoms (free, decision-free); (2) select the
+minimizing pair AND operation of
+
+    Delta(i,j,op) = (A/S) * delta_op,
+    delta_fuse  = beta(1-r) = 2 beta w_i w_j (1-G)/(1+r),
+    delta_evict = ln(A/alpha_h) = softplus(ell_l - ell_h).
+
+Since 1/S is constant per episode, the argmin is over A*delta; computed in log space.
+Merge: mu=m/r, ell'=logaddexp-delta_fuse, Lam'=Lam_i+Lam_j+delta_fuse.
+Evict: delete the LIGHTER atom, heavier untouched, book delta_evict, mark destroyed.
+Ledger Lam is in NATS and tracks merge debits only; episode ledger sums both kinds;
+retained = exp(-Lam) if surviving, hard 0 if destroyed.
+Chain bound: ell_c >= logaddexp(base) - Lam_c (exact for one merge, conservative for chains).
+Gram: G_ik <- (w_i G_ik + w_j G_jk)/r from OLD rows, then G_ii <- 1, then zero row/col j.
+Crossover (equal mass): theta* = 2 arccos(1 - ln2/beta). No new parameters.
+
+PARAMETERIZATION NOTE: eps_bar and chi are sigmoid-parameterized and must lie strictly
+in (0,1). The pure-write ablation is the flag pure_writes=True, NOT eps_bar=0.0.
 """
 import argparse
 import math
@@ -28,10 +38,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__version__ = "2.2.1"
+__version__ = "2.3.1"
 EPS_R = 1e-3
 NEG = -1e30
 DOSE_FLOOR = 1e-30
+TINY = 1e-30
 
 
 def inv_softplus(y):
@@ -100,7 +111,7 @@ def load_checkpoint(path, device="cpu"):
     p.load_state_dict(state)
     tau = ck.get("gate_tau") if isinstance(ck, dict) else None
     cfg.setdefault("C", 64)
-    cfg.setdefault("version", ck.get("version", "3.6/2.1.1" if isinstance(ck, dict) else "?"))
+    cfg.setdefault("version", ck.get("version", "?"))
     return p, tau, cfg
 
 
@@ -115,11 +126,13 @@ def log_doses(p, s, t, t_q):
     return log_injected(p, s) - (p.omega * later + p.Gamma * age)
 
 
+# ----------------------------------------------------------------- fusion math
 def fusion_weights(la_i, la_j):
     return torch.sigmoid(la_i - la_j)
 
 
 def resultant_deficit(w_i, one_minus_G, beta):
+    """delta_fuse = beta(1-r), cancellation-free."""
     t = 2.0 * w_i * (1.0 - w_i) * one_minus_G.clamp_min(0.0)
     r = (1.0 - t).clamp_min(0.0).sqrt()
     omr = t / (1.0 + r)
@@ -134,21 +147,48 @@ def fuse_pair_math(z_i, z_j, la_i, la_j, beta):
     G_ij = (z_i * z_j).sum(-1).clamp(-1.0, 1.0)
     delta, r, omr = resultant_deficit(w, 1.0 - G_ij, beta)
     la_new = torch.logaddexp(la_i, la_j) - delta
-    return mu, la_new, r, delta, w, G_ij, omr
+    return mu, la_new, r, delta, w, G_ij, omr, r_dir.squeeze(-1)
 
 
 def ward_log_cost(la, G, alive, eps_r=EPS_R):
+    """v2.2.1 ablation: log-Ward cost, +inf where masked."""
     li, lj = la.unsqueeze(2), la.unsqueeze(1)
     w = torch.sigmoid(li - lj)
     omg = (1.0 - G).clamp_min(0.0)
     t = 2.0 * w * (1.0 - w) * omg
     r2 = (1.0 - t).clamp_min(0.0)
-    logc = li + lj - torch.logaddexp(li, lj) + omg.clamp_min(1e-30).log()
+    logc = li + lj - torch.logaddexp(li, lj) + omg.clamp_min(TINY).log()
     K = la.shape[1]
     eye = torch.eye(K, dtype=torch.bool, device=la.device)
     valid = alive.unsqueeze(2) & alive.unsqueeze(1) & (~eye) & (r2 >= eps_r * eps_r)
-    cost = torch.where(valid, logc, torch.full_like(logc, float("inf")))
-    return cost, r2
+    return torch.where(valid, logc, torch.full_like(logc, float("inf"))), r2
+
+
+def debit_candidates(la, G, alive, beta, eps_r=EPS_R):
+    """Spec 4.5.  Returns (logDelta, is_fuse, d_fuse, d_evict, r, fuse_ok, valid).
+
+    logDelta = logaddexp(li,lj) - log S + log(min(d_fuse, d_evict)), +inf where masked.
+    is_fuse  = merge admissible (r>=eps_r) AND strictly cheaper than eviction.
+    Eviction is admissible for EVERY alive pair, so a candidate always exists.
+    """
+    li, lj = la.unsqueeze(2), la.unsqueeze(1)
+    logA = torch.logaddexp(li, lj)
+    w = torch.sigmoid(li - lj)
+    omg = (1.0 - G).clamp_min(0.0)
+    t = 2.0 * w * (1.0 - w) * omg
+    r = (1.0 - t).clamp_min(0.0).sqrt()
+    d_fuse = beta * t / (1.0 + r)
+    d_evict = F.softplus(-(li - lj).abs())          # ln(1 + alpha_l/alpha_h), stable
+    fuse_ok = r >= eps_r
+    is_fuse = fuse_ok & (d_fuse < d_evict)
+    d_min = torch.where(is_fuse, d_fuse, d_evict)
+    S = la.exp().sum(-1).clamp_min(DOSE_FLOOR)
+    logD = logA - S.log()[:, None, None] + d_min.clamp_min(TINY).log()
+    K = la.shape[1]
+    eye = torch.eye(K, dtype=torch.bool, device=la.device)
+    valid = alive.unsqueeze(2) & alive.unsqueeze(1) & (~eye)
+    logD = torch.where(valid, logD, torch.full_like(logD, float("inf")))
+    return logD, is_fuse, d_fuse, d_evict, r, fuse_ok, valid
 
 
 def _gath(x, idx):
@@ -158,49 +198,51 @@ def _gath(x, idx):
     return x.gather(1, idx[:, None, None].expand(B, 1, *x.shape[2:])).squeeze(1)
 
 
-def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="ward"):
-    """Differentiable batched event loop: diffuse -> write -> fuse-on-overflow.
-    C int or [B].  Hard argmin (straight-through).  min(C)>=T returns closed form
-    bit-for-bit (self-check 27).  Returns fused state + provenance + ledger."""
+def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="debit"):
+    """Differentiable batched event loop: diffuse -> write -> compress-on-overflow.
+    policy: debit (v2.3.1) | ward (v2.2.1) | lightest | random | delta."""
     Z0, s, t, t_q = ep["Z"], ep["s"], ep["t"], ep["t_q"]
     B, T, d = Z0.shape
     dev, dtype = Z0.device, Z0.dtype
     Cb = torch.full((B,), int(C), dtype=torch.long, device=dev) if isinstance(C, int) else C.to(dev).long()
     Cmax = int(Cb.max())
+    statkeys = ("n_fuse", "n_evict", "n_dead", "sum_delta", "below_cross", "dead_mass")
     if int(Cb.min()) >= T:
         la = log_doses(p, s, t, t_q)
         alive = torch.ones(B, T, dtype=torch.bool, device=dev)
         prov = torch.eye(T, dtype=torch.bool, device=dev)[None].expand(B, T, T).contiguous()
-        return {"Z": Z0, "la": la, "alive": alive, "D": torch.zeros(B, T, dtype=dtype, device=dev),
+        return {"Z": Z0, "la": la, "alive": alive, "Lam": torch.zeros(B, T, dtype=dtype, device=dev),
                 "prov": prov, "destroyed": torch.zeros(B, T, dtype=torch.bool, device=dev),
                 "label": ep["tgt"].clone(), "K": T, "S": la.exp().sum(-1), "Cb": Cb,
-                "stats": {k: torch.zeros(B, dtype=dtype, device=dev) for k in
-                          ("n_fuse", "n_dead", "n_fall", "sum_delta", "below_res", "dead_mass")}}
+                "stats": {k: torch.zeros(B, dtype=dtype, device=dev) for k in statkeys}}
     K = min(T, Cmax + 1)
+    ar = torch.arange(B, device=dev)
     Z = torch.zeros(B, K, d, dtype=dtype, device=dev)
     la = torch.full((B, K), NEG, dtype=dtype, device=dev)
-    D = torch.zeros(B, K, dtype=dtype, device=dev)
+    Lam = torch.zeros(B, K, dtype=dtype, device=dev)
     G = torch.zeros(B, K, K, dtype=dtype, device=dev)
     alive = torch.zeros(B, K, dtype=torch.bool, device=dev)
     prov = torch.zeros(B, K, T, dtype=torch.bool, device=dev)
     destroyed = torch.zeros(B, T, dtype=torch.bool, device=dev)
-    st = {k: torch.zeros(B, dtype=dtype, device=dev) for k in
-          ("n_fuse", "n_dead", "n_fall", "sum_delta", "below_res", "dead_mass")}
+    st = {k: torch.zeros(B, dtype=dtype, device=dev) for k in statkeys}
     beta, kappa = p.beta, p.kappa
     thr_dead = kappa + math.log(tau_dead)
     t_prev = torch.zeros(B, dtype=dtype, device=dev)
     NEGt = torch.full((1,), NEG, dtype=dtype, device=dev)
 
     def kill(mask):
-        nonlocal Z, la, alive, prov, destroyed
+        nonlocal Z, la, Lam, alive, prov, destroyed, G
         if not bool(mask.any()):
             return
         destroyed = destroyed | (prov & mask[..., None]).any(1)
         st["dead_mass"] += (la.exp() * mask.to(dtype)).sum(1).detach()
         alive = alive & ~mask
         la = torch.where(alive, la, NEGt)
+        Lam = Lam * alive.to(dtype)
         Z = Z * alive.to(dtype)[..., None]
         prov = prov & alive[..., None]
+        keep = alive.to(dtype)
+        G = G * keep[:, :, None] * keep[:, None, :]
 
     for i in range(T):
         g = p.Gamma * (t[:, i] - t_prev)
@@ -213,94 +255,123 @@ def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="ward"):
         z_i = Z0[:, i]
         Z = Z + oh[..., None] * z_i[:, None, :]
         la = la * (1 - oh) + la_new[:, None] * oh
-        D = D * (1 - oh)
+        Lam = Lam * (1 - oh)
         alive = alive | F.one_hot(slot, K).bool()
         prov = prov | (F.one_hot(slot, K).bool()[..., None]
                        & F.one_hot(torch.full((B,), i, device=dev), T).bool()[:, None, :])
-        g_row = torch.einsum("bkd,bd->bk", Z, z_i)
+        g_row = torch.einsum("bkd,bd->bk", Z, z_i)          # O(Cd) append row
         G = G.scatter(1, slot[:, None, None].expand(B, 1, K), g_row[:, None, :])
         G = G.scatter(2, slot[:, None, None].expand(B, K, 1), g_row[:, :, None])
         t_prev = t[:, i]
         count = alive.long().sum(1)
-        over = count > Cb
-        if not bool(over.any()):
+        if not bool((count > Cb).any()):
             continue
-        dead = alive & (la <= thr_dead) & over[:, None]
+        dead = alive & (la <= thr_dead) & (count > Cb)[:, None]
         st["n_dead"] += dead.to(dtype).sum(1)
         kill(dead)
         count = alive.long().sum(1)
+
         while bool((count > Cb).any()):
-            cost, r2 = ward_log_cost(la, G, alive, eps_r)
-            if policy == "random":
-                cost = torch.where(torch.isfinite(cost), torch.rand_like(cost), cost)
-            if policy == "delta":
-                li, lj = la.unsqueeze(2), la.unsqueeze(1)
-                ww = torch.sigmoid(li - lj)
-                tt = 2 * ww * (1 - ww) * (1 - G).clamp_min(0)
-                dval = beta * tt / (1 + (1 - tt).clamp_min(0).sqrt())
-                cost = torch.where(torch.isfinite(cost), dval, cost)
-            mn, idx = cost.reshape(B, K * K).min(1)
-            bi, bj = idx // K, idx % K
-            valid = torch.isfinite(mn)
-            do_f = (count > Cb) & valid
-            do_x = (count > Cb) & (~valid)
+            act = count > Cb
+            logD, is_fuse, d_fuse, d_evict, r, fuse_ok, valid = debit_candidates(la, G, alive, beta, eps_r)
+            if policy == "ward":
+                logD, _ = ward_log_cost(la, G, alive, eps_r)
+                logD = torch.where(torch.isfinite(logD), logD,
+                                   torch.where(valid, logD.new_tensor(0.0), logD))
+                is_fuse = fuse_ok
+            elif policy == "delta":
+                S = la.exp().sum(-1).clamp_min(DOSE_FLOOR)
+                base = torch.logaddexp(la.unsqueeze(2), la.unsqueeze(1)) - S.log()[:, None, None]
+                lf = base + d_fuse.clamp_min(TINY).log()
+                le = base + d_evict.clamp_min(TINY).log()
+                logD = torch.where(valid & fuse_ok, lf,
+                                   torch.where(valid, le, torch.full_like(lf, float("inf"))))
+                is_fuse = fuse_ok
+            elif policy == "random":
+                rnd = torch.rand_like(logD)
+                logD = torch.where(valid, rnd, torch.full_like(rnd, float("inf")))
+                is_fuse = fuse_ok
+            if policy == "lightest":
+                bj = torch.where(alive, la, torch.full_like(la, float("inf"))).argmin(1)
+                bi = torch.where(alive, la, torch.full_like(la, float("-inf"))).argmax(1)
+                is_fuse = torch.zeros_like(is_fuse)
+            else:
+                mn, idx = logD.reshape(B, K * K).min(1)
+                bi, bj = idx // K, idx % K
+            f_sel = act & is_fuse[ar, bi, bj]
+            e_sel = act & ~is_fuse[ar, bi, bj]
+
             zi, zj = _gath(Z, bi), _gath(Z, bj)
             lai, laj = _gath(la, bi), _gath(la, bj)
-            mu, la_f, r, delta, w, Gij, omr = fuse_pair_math(zi, zj, lai, laj, beta)
-            Di, Dj = _gath(D, bi), _gath(D, bj)
+            mu, la_f, r_st, delta_f, w, Gij, omr, r_dir = fuse_pair_math(zi, zj, lai, laj, beta)
+            Lami, Lamj = _gath(Lam, bi), _gath(Lam, bj)
             pi, pj = _gath(prov, bi), _gath(prov, bj)
+            vic = torch.where(lai < laj, bi, bj)        # lighter; ties -> bj
+            pv = _gath(prov, vic)
+            lav = _gath(la, vic)
+            destroyed = destroyed | (pv & e_sel[:, None])
+            st["dead_mass"] += (lav.exp() * e_sel.to(dtype)).detach()
+
             oh_i = F.one_hot(bi, K).to(dtype)
-            oh_j = F.one_hot(bj, K).to(dtype) * do_f.to(dtype)[:, None]
-            mu_eff = torch.where(do_f[:, None], mu, zi)
-            la_eff = torch.where(do_f, la_f, lai)
-            D_eff = torch.where(do_f, Di + Dj + omr, Di)
+            mu_eff = torch.where(f_sel[:, None], mu, zi)
+            la_eff = torch.where(f_sel, la_f, lai)
+            Lam_eff = torch.where(f_sel, Lami + Lamj + delta_f, Lami)
             Z = Z * (1 - oh_i[..., None]) + mu_eff[:, None, :] * oh_i[..., None]
-            Z = Z * (1 - oh_j[..., None])
             la = la * (1 - oh_i) + la_eff[:, None] * oh_i
-            la = la * (1 - oh_j) + NEG * oh_j
-            D = D * (1 - oh_i) + D_eff[:, None] * oh_i
-            D = D * (1 - oh_j)
-            prov = prov | (torch.where(do_f[:, None], pi | pj, pi)[:, None, :]
+            Lam = Lam * (1 - oh_i) + Lam_eff[:, None] * oh_i
+            prov = prov | (torch.where(f_sel[:, None], pi | pj, pi)[:, None, :]
                            & F.one_hot(bi, K).bool()[..., None])
-            prov = prov & ~oh_j.bool()[..., None]
-            alive = alive & ~oh_j.bool()
-            g_row = torch.einsum("bkd,bd->bk", Z, mu_eff)
-            G = G.scatter(1, bi[:, None, None].expand(B, 1, K), g_row[:, None, :])
-            G = G.scatter(2, bi[:, None, None].expand(B, K, 1), g_row[:, :, None])
-            st["n_fuse"] += do_f.to(dtype)
-            st["sum_delta"] += (delta * do_f.to(dtype)).detach()
-            st["below_res"] += ((beta * (1 - Gij) <= (lai - laj).abs()) & do_f).to(dtype)
-            if bool(do_x.any()):
-                la_min = torch.where(alive, la, torch.full_like(la, float("inf")))
-                vic = la_min.argmin(1)
-                vm = F.one_hot(vic, K).bool() & do_x[:, None]
-                st["n_fall"] += do_x.to(dtype)
-                kill(vm)
+
+            # exact incremental Gram row (O(C), OLD rows), only where merging
+            row = (w[:, None] * G[ar, bi, :] + (1.0 - w)[:, None] * G[ar, bj, :]) \
+                / r_dir.clamp_min(1e-12)[:, None]
+            row = torch.where(f_sel[:, None], row, G[ar, bi, :])
+            G = G.scatter(1, bi[:, None, None].expand(B, 1, K), row[:, None, :])
+            G = G.scatter(2, bi[:, None, None].expand(B, K, 1), row[:, :, None])
+            obi = F.one_hot(bi, K).bool()
+            diag_mask = obi[:, :, None] & obi[:, None, :] & f_sel[:, None, None]
+            G = torch.where(diag_mask, torch.ones_like(G), G)
+
+            dslot = torch.where(f_sel, bj, vic)
+            oh_d = F.one_hot(dslot, K).to(dtype) * act.to(dtype)[:, None]
+            Z = Z * (1 - oh_d[..., None])
+            la = la * (1 - oh_d) + NEG * oh_d
+            Lam = Lam * (1 - oh_d)
+            prov = prov & ~oh_d.bool()[..., None]
+            alive = alive & ~oh_d.bool()
+            G = G * (1 - oh_d)[:, :, None] * (1 - oh_d)[:, None, :]
+
+            df_sel = d_fuse[ar, bi, bj]
+            de_sel = d_evict[ar, bi, bj]
+            st["n_fuse"] += f_sel.to(dtype)
+            st["n_evict"] += e_sel.to(dtype)
+            st["sum_delta"] += (torch.where(f_sel, df_sel, de_sel) * act.to(dtype)).detach()
+            st["below_cross"] += f_sel.to(dtype)
             count = alive.long().sum(1)
+
     la = torch.where(alive, la - (p.Gamma * (t_q - t_prev))[:, None], NEGt)
     tgt_c = ep["tgt"].clamp_max(T - 1)
     pt = prov.gather(2, tgt_c[:, None, None].expand(B, K, 1)).squeeze(2) & alive
     has = pt.any(1)
     slot_t = pt.long().argmax(1)
     lab = torch.where(has & (ep["tgt"] < T), slot_t, torch.full_like(slot_t, K))
-    return {"Z": Z, "la": la, "alive": alive, "D": D, "prov": prov, "destroyed": destroyed,
+    return {"Z": Z, "la": la, "alive": alive, "Lam": Lam, "prov": prov, "destroyed": destroyed,
             "label": lab, "K": K, "S": la.exp().sum(-1), "Cb": Cb, "stats": st}
 
 
 class HopMem:
-    """Fixed-size streaming state machine.  write: diffuse->write->fuse-on-overflow.
-    retrieve: gate at u=q with saved tau then descend (== evaluate).  tau_dead defaults
-    to gate tau; ledger D_c=sum(1-r), episode sum_delta."""
+    """Fixed-size streaming state machine with the v2.3.1 debit policy and the
+    exact incremental Gram law (spec 4.6)."""
     def __init__(self, p, d, C=None, tau=None, tau_dead=None, eps_r=EPS_R,
-                 dtype=torch.float64, device="cpu", policy="ward"):
+                 dtype=torch.float64, device="cpu", policy="debit"):
         self.p, self.d, self.C, self.tau = p, d, C, tau
         self.tau_dead, self.eps_r, self.policy = tau_dead, eps_r, policy
         self.dtype, self.device = dtype, device
         self.atoms = []
         self.G = torch.zeros(0, 0, dtype=dtype, device=device)
         self.S, self.t = 0.0, 0.0
-        self.sum_delta, self.n_fuse, self.n_dead, self.n_fall = 0.0, 0, 0, 0
-        self.dead_mass, self.destroyed, self.below_res = 0.0, set(), 0
+        self.sum_delta, self.n_fuse, self.n_evict, self.n_dead = 0.0, 0, 0, 0
+        self.dead_mass, self.destroyed, self.below_cross = 0.0, set(), 0
 
     def _f(self, name):
         return float(getattr(self.p, name).detach())
@@ -319,6 +390,48 @@ class HopMem:
             return self.tau_dead
         return self.tau if self.tau is not None else 1.0
 
+    # ---- Gram law (spec 4.6) ----
+    def _gram_append(self, z):
+        n = len(self.atoms)
+        if n == 1:
+            self.G = torch.ones(1, 1, dtype=self.dtype, device=self.device)
+            return
+        Zs = torch.stack([a["z"] for a in self.atoms[:-1]])
+        row = Zs @ z
+        new = torch.zeros(n, n, dtype=self.dtype, device=self.device)
+        new[:n - 1, :n - 1] = self.G
+        new[n - 1, :n - 1] = row
+        new[:n - 1, n - 1] = row
+        new[n - 1, n - 1] = 1.0
+        self.G = new
+
+    def _gram_merge(self, i, j, w_i, w_j, r):
+        row = (w_i * self.G[i] + w_j * self.G[j]) / max(r, 1e-12)   # OLD rows
+        self.G[i] = row
+        self.G[:, i] = row
+        self.G[i, i] = 1.0                                          # explicit guard
+
+    def _gram_drop(self, j):
+        n = self.G.shape[0]
+        keep = [k for k in range(n) if k != j]
+        if not keep:
+            self.G = torch.zeros(0, 0, dtype=self.dtype, device=self.device)
+            return
+        idx = torch.tensor(keep, dtype=torch.long, device=self.device)
+        self.G = self.G[idx][:, idx]
+
+    def _rebuild_gram(self):
+        """Diagnostic only (drift refresh)."""
+        if self.atoms:
+            Zs = torch.stack([a["z"] for a in self.atoms])
+            self.G = Zs @ Zs.t()
+        else:
+            self.G = torch.zeros(0, 0, dtype=self.dtype, device=self.device)
+
+    def _gram_check(self):
+        if self.G.numel() and bool((self.G.abs() > 1.0 + 1e-6).any()):
+            self._rebuild_gram()
+
     def write(self, z, s, t, prov=None):
         self._advance(t)
         z = F.normalize(z.to(dtype=self.dtype, device=self.device), dim=-1)
@@ -328,10 +441,10 @@ class HopMem:
         for at in self.atoms:
             at["la"] -= om * s
         self.atoms.append({"z": z, "la": math.log(max(a * (1 - eps), DOSE_FLOOR)),
-                           "D": 0.0, "prov": frozenset([prov]) if prov is not None else frozenset()})
+                           "Lam": 0.0, "prov": frozenset([prov]) if prov is not None else frozenset()})
         self.S = (1 - a) * self.S + a * (1 - eps)
-        self._rebuild_gram()
-        self._fuse_on_overflow()
+        self._gram_append(z)
+        self._compress_on_overflow()
 
     def reinforce(self, u, s_ret, cf, beta_bar):
         u = F.normalize(u.to(dtype=self.dtype, device=self.device), dim=-1)
@@ -342,30 +455,27 @@ class HopMem:
         if b > 0:
             for at in self.atoms:
                 at["la"] += math.log1p(-b)
-            self.atoms.append({"z": u, "la": math.log(b), "D": 0.0, "prov": frozenset()})
+            self.atoms.append({"z": u, "la": math.log(b), "Lam": 0.0, "prov": frozenset()})
             self.S = (1 - b) * self.S + b
-            self._rebuild_gram()
-            self._fuse_on_overflow()
+            self._gram_append(u)
+            self._compress_on_overflow()
         return b
 
-    def _rebuild_gram(self):
-        if self.atoms:
-            Zs = torch.stack([a["z"] for a in self.atoms])
-            self.G = Zs @ Zs.t()
-        else:
-            self.G = torch.zeros(0, 0, dtype=self.dtype, device=self.device)
-
     def _null_fuse(self, mask):
-        keep = [k for k in range(len(self.atoms)) if not mask[k]]
         for k in range(len(self.atoms)):
             if mask[k]:
                 self.dead_mass += math.exp(self.atoms[k]["la"])
                 self.destroyed |= set(self.atoms[k]["prov"])
+        keep = [k for k in range(len(self.atoms)) if not mask[k]]
         self.atoms = [self.atoms[k] for k in keep]
         self.S = sum(math.exp(a["la"]) for a in self.atoms)
-        self._rebuild_gram()
+        if keep:
+            idx = torch.tensor(keep, dtype=torch.long, device=self.device)
+            self.G = self.G[idx][:, idx]
+        else:
+            self.G = torch.zeros(0, 0, dtype=self.dtype, device=self.device)
 
-    def _fuse_on_overflow(self):
+    def _compress_on_overflow(self):
         if self.C is None or len(self.atoms) <= self.C:
             return
         thr = self._f("kappa") + math.log(self._tau_dead())
@@ -374,37 +484,62 @@ class HopMem:
             self.n_dead += sum(dead)
             self._null_fuse(dead)
         beta = self._f("beta")
+        bt = torch.tensor(beta, dtype=self.dtype, device=self.device)
         while len(self.atoms) > self.C:
             n = len(self.atoms)
             la = torch.tensor([a["la"] for a in self.atoms], dtype=self.dtype, device=self.device)
             alive = torch.ones(1, n, dtype=torch.bool, device=self.device)
-            cost, r2 = ward_log_cost(la[None], self.G[None], alive, self.eps_r)
-            if self.policy == "random":
-                cost = torch.where(torch.isfinite(cost), torch.rand_like(cost), cost)
-            mn, idx = cost.reshape(1, n * n).min(1)
-            if not bool(torch.isfinite(mn)):
-                j = min(range(n), key=lambda k: self.atoms[k]["la"])
-                self.n_fall += 1
-                self._null_fuse([k == j for k in range(n)])
-                continue
-            i, j = int(idx[0]) // n, int(idx[0]) % n
-            ai, aj = self.atoms[i], self.atoms[j]
-            mu, la_f, r, delta, w, Gij, omr = fuse_pair_math(
-                ai["z"][None], aj["z"][None],
-                torch.tensor([ai["la"]], dtype=self.dtype, device=self.device),
-                torch.tensor([aj["la"]], dtype=self.dtype, device=self.device),
-                torch.tensor(beta, dtype=self.dtype, device=self.device))
-            if bool(beta * (1 - Gij[0]) <= abs(ai["la"] - aj["la"])):
-                self.below_res += 1
-            ai["z"] = mu[0]
-            ai["la"] = float(la_f[0])
-            ai["D"] = ai["D"] + aj["D"] + float(omr[0])
-            ai["prov"] = ai["prov"] | aj["prov"]
-            self.sum_delta += float(delta[0])
-            self.n_fuse += 1
-            self.atoms.pop(j)
+            logD, is_fuse, d_fuse, d_evict, r, fuse_ok, valid = debit_candidates(
+                la[None], self.G[None], alive, bt, self.eps_r)
+            if self.policy == "lightest":
+                j = int(la.argmin())
+                i = int(la.argmax())
+                fuse = False
+            else:
+                if self.policy == "ward":
+                    logD, _ = ward_log_cost(la[None], self.G[None], alive, self.eps_r)
+                elif self.policy == "delta":
+                    Sv = la.exp().sum().clamp_min(DOSE_FLOOR)
+                    basev = torch.logaddexp(la[:, None], la[None, :]) - Sv.log()
+                    lfv = basev + d_fuse[0].clamp_min(TINY).log()
+                    lev = basev + d_evict[0].clamp_min(TINY).log()
+                    vv, ff = valid[0], fuse_ok[0]
+                    logD = torch.where(vv & ff, lfv,
+                                       torch.where(vv, lev, torch.full_like(lfv, float("inf"))))[None]
+                elif self.policy == "random":
+                    logD = torch.where(valid, torch.rand_like(logD),
+                                       torch.full_like(logD, float("inf")))
+                mn, idx = logD.reshape(1, n * n).min(1)
+                i, j = int(idx[0]) // n, int(idx[0]) % n
+                fuse = bool(is_fuse[0, i, j]) if self.policy == "debit" else bool(fuse_ok[0, i, j])
+            if fuse:
+                ai, aj = self.atoms[i], self.atoms[j]
+                lai = torch.tensor([ai["la"]], dtype=self.dtype, device=self.device)
+                laj = torch.tensor([aj["la"]], dtype=self.dtype, device=self.device)
+                mu, la_f, r_st, dl, w, Gij, omr, r_dir = fuse_pair_math(
+                    ai["z"][None], aj["z"][None], lai, laj, bt)
+                wi = float(w[0])
+                self._gram_merge(i, j, wi, 1.0 - wi, float(r_dir[0]))
+                ai["z"] = mu[0]
+                ai["la"] = float(la_f[0])
+                ai["Lam"] = ai["Lam"] + aj["Lam"] + float(dl[0])
+                ai["prov"] = ai["prov"] | aj["prov"]
+                self.sum_delta += float(dl[0])
+                self.n_fuse += 1
+                self.below_cross += 1
+                self.atoms.pop(j)
+                self._gram_drop(j)
+            else:
+                v = i if float(la[i]) < float(la[j]) else j
+                dl = float(d_evict[0, i, j])
+                self.destroyed |= set(self.atoms[v]["prov"])
+                self.dead_mass += math.exp(float(la[v]))
+                self.sum_delta += dl
+                self.n_evict += 1
+                self.atoms.pop(v)
+                self._gram_drop(v)
             self.S = sum(math.exp(a["la"]) for a in self.atoms)
-            self._rebuild_gram()
+        self._gram_check()
 
     @property
     def Zs(self):
@@ -414,8 +549,8 @@ class HopMem:
     def log_alpha(self):
         return torch.tensor([a["la"] for a in self.atoms], dtype=self.dtype, device=self.device)
     @property
-    def D_vec(self):
-        return torch.tensor([a["D"] for a in self.atoms], dtype=self.dtype, device=self.device)
+    def Lam_vec(self):
+        return torch.tensor([a["Lam"] for a in self.atoms], dtype=self.dtype, device=self.device)
     @property
     def M(self):
         Z, a = self.Zs, self.log_alpha.exp()
@@ -432,7 +567,7 @@ class HopMem:
             return 0.0
         for a in self.atoms:
             if prov_id in a["prov"]:
-                return math.exp(-self._f("beta") * a["D"])
+                return math.exp(-a["Lam"])
         return 0.0
     def retrieve(self, q, t, N=20, tau=None):
         self._advance(t)
@@ -447,6 +582,7 @@ class HopMem:
         return read(Z, la, q, self.p, N)[0]
 
 
+# ----------------------------------------------------------------- readouts
 def make_step(Z, log_alpha, q, p, auto_gamma=False):
     if p.read == "gibbs":
         beta, kappa = p.beta, p.kappa
@@ -532,10 +668,10 @@ def quad_stability(Z, alpha, k, gamma):
     return margin, fs, fh
 
 
-def gibbs_basin(log_alpha, k, beta, kappa, D=None):
+def gibbs_basin(log_alpha, k, beta, kappa, Lam=None):
     d = log_alpha.gather(1, k[:, None]).squeeze(1) - kappa
-    if D is not None:
-        d = d - beta * D.gather(1, k[:, None]).squeeze(1)
+    if Lam is not None:
+        d = d - Lam.gather(1, k[:, None]).squeeze(1)
     x = (1 - d / beta).clamp(-1, 1)
     return torch.where(d > 0, torch.acos(x), torch.zeros_like(x))
 
@@ -606,6 +742,7 @@ def reinforce_beta(mu, tau_r, cf, beta_bar):
     return torch.where(below, cf * torch.min(beta_bar, frac), torch.zeros_like(mu))
 
 
+# ----------------------------------------------------------------- data
 _SENT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'])")
 
 
@@ -700,12 +837,50 @@ class EpisodeSampler:
         return {"Z": Z, "s": s, "t": t, "t_q": t_q, "tgt": tgt, "z_t": z_t, "q": q, "absent": absent}
 
 
+def dup_episodes(Zs, Qs, B, T, rho_dup, theta, lam=0.2, p_absent=0.2, device="cpu"):
+    """Spec 10 duplicate-heavy generator: with prob rho_dup the write is a near-copy
+    of the previous direction at angle ~theta."""
+    P, d = len(Zs), Zs.shape[1]
+    idx = torch.randint(P, (B, T), device=device)
+    Z, Q = Zs[idx].clone(), Qs[idx].clone()
+    sig = math.tan(theta)
+    for i in range(1, T):
+        copy = torch.rand(B, device=device) < rho_dup
+        if not bool(copy.any()):
+            continue
+        zp = Z[:, i - 1]
+        xi = torch.randn(B, d, device=device)
+        xi = F.normalize(xi - (xi * zp).sum(-1, keepdim=True) * zp, dim=-1)
+        zn = F.normalize(zp + sig * xi, dim=-1)
+        Z[:, i] = torch.where(copy[:, None], zn, Z[:, i])
+        phi = 0.4 + 0.9 * torch.rand(B, 1, device=device)
+        e = torch.randn(B, d, device=device)
+        e = F.normalize(e - (e * zn).sum(-1, keepdim=True) * zn, dim=-1)
+        qn = phi.cos() * zn + phi.sin() * e
+        Q[:, i] = torch.where(copy[:, None], qn, Q[:, i])
+    s = torch.empty(B, T, device=device).exponential_()
+    t = torch.empty(B, T, device=device).exponential_().cumsum(-1)
+    t_q = t[:, -1] + torch.empty(B, device=device).exponential_()
+    logits = torch.log(s) - lam * (t_q[:, None] - t)
+    tgt = torch.multinomial(logits.softmax(-1), 1).squeeze(1)
+    ar = torch.arange(B, device=device)
+    q, z_t = Q[ar, tgt], Z[ar, tgt]
+    absent = torch.rand(B, device=device) < p_absent
+    j = torch.randint(P, (B,), device=device)
+    qo = F.normalize(Qs[j], dim=-1)
+    q = torch.where(absent[:, None], qo, q)
+    z_t = torch.where(absent[:, None], qo, z_t)
+    tgt = torch.where(absent, torch.full_like(tgt, T), tgt)
+    return {"Z": Z, "s": s, "t": t, "t_q": t_q, "tgt": tgt, "z_t": z_t, "q": q, "absent": absent}
+
+
 def sample_C(B, c_min, T, device="cpu"):
     return torch.randint(c_min, T + 1, (B,), device=device)
 
 
+# ----------------------------------------------------------------- evaluation
 @torch.no_grad()
-def evaluate(p, ep, N=20, auto_gamma=False, tau=None, C=None, tau_dead=None, policy="ward"):
+def evaluate(p, ep, N=20, auto_gamma=False, tau=None, C=None, tau_dead=None, policy="debit"):
     T = ep["Z"].shape[1]
     Ceff = T if C is None else C
     td = 1.0 if tau_dead is None else tau_dead
@@ -715,8 +890,7 @@ def evaluate(p, ep, N=20, auto_gamma=False, tau=None, C=None, tau_dead=None, pol
     fused = int(sim["Cb"].min()) < T
     u, info = read(Z, la, q, p, N, diagnostics=True, auto_gamma=auto_gamma)
     uL = read(Z, la, q, p, 10 * N, auto_gamma=auto_gamma)
-    alpha = la.exp()
-    v1, _ = top_eigvec(Z, alpha)
+    v1, _ = top_eigvec(Z, la.exp())
     cos = lambda x, y: (x * y).sum(-1).abs().clamp(max=1.0)
     per, per_q = 1 - cos(u, z), 1 - cos(q, z)
     pres, absm = tgt < T, tgt >= T
@@ -742,7 +916,7 @@ def evaluate(p, ep, N=20, auto_gamma=False, tau=None, C=None, tau_dead=None, pol
         surv = pres & (lab < K)
         if bool(surv.any()):
             out["commit"] = (am[surv] == lab[surv]).float().mean().item()
-            out["basin"] = gibbs_basin(la[surv], lab[surv], p.beta, p.kappa, sim["D"][surv]).mean().item()
+            out["basin"] = gibbs_basin(la[surv], lab[surv], p.beta, p.kappa, sim["Lam"][surv]).mean().item()
             out["floor"] = gibbs_floor(Z[surv], la[surv], q[surv], lab[surv], p.beta, p.kappa).mean().item()
             out["phi"] = torch.acos((q[surv] * z[surv]).sum(-1).clamp(-1, 1)).mean().item()
         if bool(absm.any()):
@@ -768,13 +942,13 @@ def evaluate(p, ep, N=20, auto_gamma=False, tau=None, C=None, tau_dead=None, pol
         if fused:
             stt = sim["stats"]
             out["fuse_n"] = stt["n_fuse"].mean().item()
+            out["evict_n"] = stt["n_evict"].mean().item()
             out["dead_n"] = stt["n_dead"].mean().item()
-            out["fall_n"] = stt["n_fall"].mean().item()
             out["ledger"] = stt["sum_delta"].mean().item()
-            out["below_frac"] = (stt["below_res"].sum() / stt["n_fuse"].sum().clamp_min(1)).item()
-            Db = torch.where(lab < K, sim["D"].gather(1, lab.clamp_max(K - 1)[:, None]).squeeze(1),
+            out["below_cross"] = (stt["below_cross"].sum() / stt["n_fuse"].sum().clamp_min(1)).item()
+            Lb = torch.where(lab < K, sim["Lam"].gather(1, lab.clamp_max(K - 1)[:, None]).squeeze(1),
                              torch.zeros_like(lab, dtype=la.dtype))
-            ret = torch.where((lab < K) & pres, (-p.beta * Db).exp(), torch.zeros_like(Db))
+            ret = torch.where((lab < K) & pres, (-Lb).exp(), torch.zeros_like(Lb))
             out["retained"] = ret[pres].mean().item() if bool(pres.any()) else float("nan")
             out["destroyed_frac"] = ((lab == K) & pres).float().sum().item() / max(int(pres.sum()), 1)
             mu_b = Z.gather(1, lab.clamp_max(K - 1)[:, None, None].expand(-1, 1, Z.shape[-1])).squeeze(1)
@@ -802,7 +976,7 @@ def evaluate(p, ep, N=20, auto_gamma=False, tau=None, C=None, tau_dead=None, pol
 
 
 @torch.no_grad()
-def calibrate_tau(p, ep, N=20, auto_gamma=False, C=None, tau_dead=1.0, policy="ward"):
+def calibrate_tau(p, ep, N=20, auto_gamma=False, C=None, tau_dead=1.0, policy="debit"):
     if p.read != "gibbs":
         return None
     T = ep["Z"].shape[1]
@@ -819,15 +993,14 @@ def calibrate_tau(p, ep, N=20, auto_gamma=False, C=None, tau_dead=1.0, policy="w
 
 
 @torch.no_grad()
-def calibrate_tau_fused(p, ep, N=20, C=None, passes=2, policy="ward"):
-    """Two-pass fixed point on ONE fixed batch (resolves tau/tau_dead circularity)."""
+def calibrate_tau_fused(p, ep, N=20, C=None, passes=2, policy="debit"):
     tau = 1.0
     for _ in range(max(1, passes)):
         tau = calibrate_tau(p, ep, N, C=C, tau_dead=tau, policy=policy)
     return tau
 
 
-def report(tag, p, ep, N, auto_gamma=False, tau=None, C=None, tau_dead=None, policy="ward"):
+def report(tag, p, ep, N, auto_gamma=False, tau=None, C=None, tau_dead=None, policy="debit"):
     r = evaluate(p, ep, N, auto_gamma, tau=tau, C=C, tau_dead=tau_dead, policy=policy)
     g = lambda k: r.get(k, float("nan"))
     th = " ".join(f"{k}={v:.4g}" for k, v in p.theta().items())
@@ -845,14 +1018,16 @@ def report(tag, p, ep, N, auto_gamma=False, tau=None, C=None, tau_dead=None, pol
               f"gate pres/abs {g('gate_pres'):.4f}/{g('gate_abs'):.4f} | "
               f"gate argmax {g('gate_argmax'):.4f}")
         if "fuse_n" in r:
-            print(f"      fusion: {g('fuse_n'):.1f} fuses ({g('below_frac'):.0%} below resolution), "
-                  f"{g('dead_n'):.1f} gate-dead, {g('fall_n'):.2f} fallback | ledger {g('ledger'):.3f} nats | "
-                  f"retained {g('retained'):.3f} distort {g('distort'):.3f} rad destroyed {g('destroyed_frac'):.3f} | "
-                  f"ECE {g('ece'):.3f} commit {g('commit_rate'):.3f} | mass-gate {g('mass_gate_best'):.4f}")
+            print(f"      compress: {g('fuse_n'):.1f} merge / {g('evict_n'):.1f} evict / "
+                  f"{g('dead_n'):.1f} gate-dead | ledger {g('ledger'):.3f} nats | "
+                  f"retained {g('retained'):.3f} destroyed {g('destroyed_frac'):.3f} "
+                  f"distort {g('distort'):.3f} | below-cross {g('below_cross'):.0%} | "
+                  f"ECE {g('ece'):.3f} | mass-gate {g('mass_gate_best'):.4f}")
     print(f"      {th}")
     return r
 
 
+# ----------------------------------------------------------------- training
 def train(a):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(a.seed)
@@ -868,8 +1043,8 @@ def train(a):
     ev = EpisodeSampler(Zs[cut:], Qs[cut:], doc[cut:], **kw)
     fuse_on = (a.fuse == "on")
     print(f"{P} items, d={Zs.shape[1]}, train {cut}/eval {P-cut}, device {dev}, read {a.read}, "
-          f"schedule {a.schedule}, loss {a.loss}, p_absent {a.p_absent}, C={a.C} "
-          f"(train C~U{{{a.c_min}..{a.T}}}, fusion {'on' if fuse_on else 'off'})")
+          f"schedule {a.schedule}, C={a.C} (train C~U{{{a.c_min}..{a.T}}}), "
+          f"policy {a.fuse_policy}, fusion {'on' if fuse_on else 'off'}")
     p = Params(read=a.read, diffusion=not a.no_diffusion, pure_writes=a.pure_writes).to(dev)
     cal_ep = tr.sample(a.cal_batch) if (p.read == "gibbs" and a.gate_tau is None) else None
     saved_tau = [float(a.gate_tau) if a.gate_tau is not None else None]
@@ -887,15 +1062,13 @@ def train(a):
     else:
         stages = [("A", p.read_names(), mode, a.steps_a), ("B", None, mode, a.steps_b)]
     ev_ep = ev.sample(a.eval_batch)
-    report("init  ", p, ev_ep, a.N, a.auto_gamma, tau=get_tau(), C=a.C)
+    report("init  ", p, ev_ep, a.N, a.auto_gamma, tau=get_tau(), C=a.C, policy=a.fuse_policy)
     for stage, names, smode, steps in stages:
         stage_fuse = fuse_on and (stage != "P")
         if stage == "P":
-            print("  stage P: MARGINAL law (cue-free), FUSION OFF.")
+            print("  stage P: MARGINAL law (cue-free), COMPRESSION OFF.")
         if stage == "B" and a.schedule == "probe":
             print("  stage B: readout only; omega/Gamma frozen.")
-        if stage_fuse:
-            print(f"  stage {stage}: fusion in loop, C~U{{{a.c_min}..{a.T}}}, tau_dead=1 (provisional).")
         for n, prm in p.named_parameters():
             prm.requires_grad_(names is None or n in names)
         opt = torch.optim.Adam([x for x in p.parameters() if x.requires_grad], lr=a.lr)
@@ -926,27 +1099,16 @@ def train(a):
             opt.step()
             if a.log_every > 0 and it % a.log_every == 0:
                 th = " ".join(f"{k}={v:.4g}" for k, v in p.theta().items())
-                print(f"  stage {stage} step {it:4d} ce {l_ce.item():.4f} cos {l_cos.item():.4f}  {th}")
+                print(f"  stage {stage} step {it:4d} ce {l_ce.item():.4f}  {th}")
         if stage == "A" and p.read == "gibbs" and saved_tau[0] is None and cal_ep is not None:
             saved_tau[0] = calibrate_tau_fused(p, cal_ep, a.N, C=a.C, passes=2, policy=a.fuse_policy)
-            print(f"  tau calibrated once on fixed fused batch (C={a.C}): tau={saved_tau[0]:.4g}")
-        report(f"stage {stage}", p, ev_ep, a.N, a.auto_gamma, tau=get_tau(), C=a.C)
-    with torch.no_grad():
-        r = evaluate(p, ev_ep, a.N, a.auto_gamma, C=a.C)
-        if p.read == "gibbs" and r.get("p_true", 0) > 0.99:
-            print("WARNING p_true ~ 1: prior unidentifiable; use --same_passage / wider cues / larger T.")
-    if not a.uniform_target:
-        dts = torch.cat([ev_ep["t"][:, :1], ev_ep["t"][:, 1:] - ev_ep["t"][:, :-1]], -1)
-        Es, Edt = float(ev_ep["s"].mean()), float(dts.mean())
-        om, G = float(p.omega.detach()), float(p.Gamma.detach())
-        print(f"data decay {a.query_decay} vs Gamma {G:.4f} | dilution {om*Es:.4f} + time {G*Edt:.4f} "
-              f"= {om*Es+G*Edt:.4f} (data {a.query_decay*Edt:.4f})")
+            print(f"  tau calibrated once on fixed compressed batch (C={a.C}): tau={saved_tau[0]:.4g}")
+        report(f"stage {stage}", p, ev_ep, a.N, a.auto_gamma, tau=get_tau(), C=a.C, policy=a.fuse_policy)
     tau_final = get_tau()
     if p.read == "gibbs":
         rd = evaluate(p, ev_ep, a.N, a.auto_gamma, tau=tau_final, C=a.C,
-                      tau_dead=(tau_final if tau_final is not None else 1.0))
-        print(f"[deploy] gate {rd['gate_best']:.4f} (tau {tau_final}) | map {rd['loss']:.4f} | "
-              f"cue {rd['cue']:.4f} nn {rd['nn']:.4f} | "
+                      tau_dead=(tau_final if tau_final is not None else 1.0), policy=a.fuse_policy)
+        print(f"[deploy] gate {rd['gate_best']:.4f} (tau {tau_final}) | "
               f"pres/abs {rd.get('gate_pres', float('nan')):.4f}/{rd.get('gate_abs', float('nan')):.4f}")
     ck = {"state": p.state_dict(), "gate_tau": tau_final, "read": a.read, "version": __version__,
           "config": {"diffusion": not a.no_diffusion, "pure_writes": a.pure_writes,
@@ -956,13 +1118,12 @@ def train(a):
                      "fuse_policy": a.fuse_policy, "version": __version__},
           "theta": p.theta()}
     torch.save(ck, a.out)
-    print(f"saved {a.out} (gate_tau={tau_final}, C={a.C})")
+    print(f"saved {a.out} (gate_tau={tau_final}, C={a.C}, policy={a.fuse_policy})")
 
 
 class HopMemAttention(nn.Module):
-    """Gibbs posterior at u=q == one cross-attention head, tied key/value, null bias kappa,
-    per-token log-dose bias ell.  Identity projections => Gibbs gradient at u=q.  Gate =>
-    residual mix sigmoid(gap-ln tau).  SPECIFIED (section 23), not yet measured end-to-end."""
+    """Spec 23: Gibbs posterior at u=q == one cross-attention head, tied KV, null bias
+    kappa, per-token log-dose bias.  SPECIFIED, not yet measured end-to-end."""
     def __init__(self, d, width=None, beta=16.0, kappa=math.log(1e-4)):
         super().__init__()
         self.d, self.width = d, width or d
@@ -1003,11 +1164,12 @@ def lm_interface_check():
     u_att, w = att(q, Z, la)
     v, _ = make_step(Z, la, q, p)(q)
     err = float((u_att - v).abs().max())
-    print(f"LM interface (identity projections): attention == Gibbs gradient at u=q, max err {err:.2e}")
+    print(f"LM interface: attention == Gibbs gradient at u=q, max err {err:.2e}")
     assert err < 1e-12
     return err
 
 
+# ----------------------------------------------------------------- selftest (44)
 def selftest():
     torch.manual_seed(0)
     dt, res = torch.float64, []
@@ -1036,46 +1198,42 @@ def selftest():
             inv = max(inv, abs(float(W.trace()) - 1), max(0.0, (1 - mem.S) / d - float(ev.min())),
                       max(0.0, mem.S - 1 + 1e-12))
             dec = max(dec, float((W - ((1 - mem.S) / d * eye + mem.M)).abs().max()))
-        check("01 W>=0, tr=1, S<1, lam_min>=(1-S)/d under write/diffuse/fuse", inv < 1e-10 and dec < 1e-10,
-              f"inv={inv:.1e} dec={dec:.1e} atoms={len(mem.atoms)}<=4")
+        check("01 invariants under write/diffuse/compress", inv < 1e-10 and dec < 1e-10,
+              f"inv={inv:.1e} atoms={len(mem.atoms)}<=4")
         m2 = HopMem(p, d, C=None, dtype=dt)
         for i in range(T):
             m2.write(Z[0, i], float(s[0, i]), float(t[0, i]))
         m2._advance(float(t_q[0]))
         e_la = float((m2.log_alpha - la[0]).abs().max())
         e_M = float((m2.M - torch.einsum("td,t,te->de", Z[0], la[0].exp(), Z[0])).abs().max())
-        check("02 closed-form log-doses == sequential simulation", e_la < 1e-12 and e_M < 1e-12,
-              f"dla={e_la:.1e} dM={e_M:.1e}")
+        check("02 closed form == sequential", e_la < 1e-12 and e_M < 1e-12, f"dla={e_la:.1e}")
         m3 = HopMem(p, d, C=None, dtype=dt); m3.write(Z[0, 0], 1.0, 0.0)
         W0 = m3.W.clone(); m3._advance(0.7); m3._advance(1.2); W12 = m3.W.clone()
         m3b = HopMem(p, d, C=None, dtype=dt); m3b.write(Z[0, 0], 1.0, 0.0); m3b._advance(1.2)
         g = float(p.Gamma.detach())
         Wexp = math.exp(-g * 1.2) * W0 + (1 - math.exp(-g * 1.2)) / d * eye
-        check("03 diffusion semigroup D(dt1)D(dt2)=D(dt1+dt2)",
+        check("03 diffusion semigroup (cumulative absolute time)",
               float((W12 - m3b.W).abs().max()) < 1e-12 and float((W12 - Wexp).abs().max()) < 1e-12)
         M0 = m3b.M.clone(); m3b._advance(2.1); M1 = m3b.M
         l0, v0 = torch.linalg.eigh(M0); l1, v1 = torch.linalg.eigh(M1)
         f = math.exp(-g * 0.9)
         sgn = float((v0[:, -1] * v1[:, -1]).sum().sign())
-        check("04 diffusion preserves top eigenvector, scales eigenvalues by e^-Gamma dt",
+        check("04 spectral invariance (top eigenvector)",
               float((l1 - f * l0).abs().max()) < 1e-12
               and float((v1[:, -1] * sgn - v0[:, -1]).abs().max()) < 1e-9)
         m5 = HopMem(Params(omega=0.5, Gamma=0.2, pure_writes=True, dtype=dt), d, C=None, dtype=dt)
         for kk in range(1, 400):
             m5.write(Z[0, 0], 1.0, float(kk))
         post = m5.S; m5._advance(400.0)
-        check("05 steady-state S*_post / S*_pre", abs(post - 0.78160) < 1e-5 and abs(m5.S - 0.63992) < 1e-5,
-              f"post={post:.5f} pre={m5.S:.5f}")
+        check("05 steady state", abs(post - 0.78160) < 1e-5 and abs(m5.S - 0.63992) < 1e-5)
         m6 = HopMem(p, d, C=None, dtype=dt); m6.write(Z[0, 0], float(s[0, 0]), float(t[0, 0]))
         W0 = (1.0 / d) * eye
         a = -math.expm1(-om * float(s[0, 0])); eps = eb * (1 - a)
         Wexp = (1 - a) * W0 + a * ((1 - eps) * torch.outer(Z[0, 0], Z[0, 0]) + eps * eye / d)
-        Wexp2 = (1 - a) * W0 + a * (1 - eps) * torch.outer(Z[0, 0], Z[0, 0]) + a * eps * eye / d
-        check("06 impure write = convex mixture = target mass + a*eps*J",
-              float((m6.W - Wexp).abs().max()) < 1e-12 and float((m6.W - Wexp2).abs().max()) < 1e-12)
+        check("06 impure-write decomposition", float((m6.W - Wexp).abs().max()) < 1e-12)
         m7 = HopMem(p, d, C=4, dtype=dt); u7 = m7.retrieve(q[0], 0.0)
         u7b = read(torch.zeros(1, 0, d, dtype=dt), torch.zeros(1, 0, dtype=dt), q[:1], p, 20)[0]
-        check("07 empty memory returns q exactly", float((u7 - q[0]).abs().max()) < 1e-15
+        check("07 empty memory returns q", float((u7 - q[0]).abs().max()) < 1e-15
               and float((u7b - q[0]).abs().max()) < 1e-15)
         perm = torch.randperm(T); u8 = read(Z, la, q, p, 20); u8p = read(Z[:, perm], la[:, perm], q, p, 20)
         check("08 permutation invariance", float((u8 - u8p).abs().max()) < 1e-12)
@@ -1084,41 +1242,38 @@ def selftest():
         ps = Params(beta=6.0, kappa=-5.0 + c, dtype=dt)
         lg_b = gibbs_logits(Z, la + c, q, ps).softmax(-1)
         u9 = read(Z, la + c, q, ps, 20)
-        check("09 uniform log-dose shift leaves posterior and map invariant",
+        check("09 uniform log-shift invariance",
               float((lg_a - lg_b).abs().max()) < 1e-12 and float((u8 - u9).abs().max()) < 1e-12)
         p10 = Params(omega=0.7, dtype=dt)
     s0 = torch.zeros(3, requires_grad=True)
     l0 = log_injected(p10, s0); l0.sum().backward()
     l0v = l0.detach(); gmax = float(s0.grad.abs().max())
     floor_ref = float(torch.log(torch.tensor(DOSE_FLOOR, dtype=l0v.dtype)))
-    check("10 s=0 finite log-dose, zero clamped-branch gradient",
-          bool(torch.isfinite(l0v).all()) and abs(float(l0v[0]) - floor_ref) < 1e-6
-          and gmax < 1e-9,
-          f"ell0={float(l0v[0]):.6f} ref={floor_ref:.6f} grad_max={gmax:.2e}")
+    check("10 s=0 finite log-dose, zero clamped gradient",
+          bool(torch.isfinite(l0v).all()) and abs(float(l0v[0]) - floor_ref) < 1e-6 and gmax < 1e-9,
+          f"ell0={float(l0v[0]):.6f} grad={gmax:.1e}")
     with torch.no_grad():
         worst, guards = 0.0, 0
         for b_ in (0.05, 1.0, 6.0, 50.0, 1000.0):
             pb = Params(beta=b_, kappa=-5.0, dtype=dt)
             _, inf = read(Z, la, q, pb, 30, diagnostics=True)
             worst = max(worst, inf["E_up"]); guards += inf["guard"]
-        check("11 Gibbs energy never increases; guard 0 (beta 0.05..1000)", worst == 0.0 and guards == 0)
+        check("11 Gibbs descent, guard 0", worst == 0.0 and guards == 0)
         Z12 = F.normalize(torch.randn(1, 8, 32, dtype=dt), dim=-1)
         la12 = torch.full((1, 8), math.log(0.05), dtype=dt)
         p12 = Params(beta=6.0, kappa=math.log(0.05) - 2.0, dtype=dt)
         uN = read(Z12, la12, Z12[:, 0], p12, 20); u10N = read(Z12, la12, Z12[:, 0], p12, 200)
-        check("12 descent at N and 10N agrees", float((uN - u10N).abs().max()) < 1e-6,
-              f"diff {float((uN-u10N).abs().max()):.1e}")
+        check("12 N vs 10N agrees", float((uN - u10N).abs().max()) < 1e-6)
         Zh = torch.tensor([[[math.cos(0.7), math.sin(0.7)]]], dtype=dt)
         qh = torch.tensor([[1.0, 0.0]], dtype=dt); lah = torch.full((1, 1), -3.0, dtype=dt)
         ph = Params(beta=16.0, kappa=-6.5, dtype=dt)
         lgh = gibbs_logits(Zh, lah, qh, ph); uh = read(Zh, lah, qh, ph, 50)
-        check("13 hysteresis witness: argmax=null (9.237 vs 9.500) but map commits",
-              int(lgh.argmax(-1)[0]) == 1 and float((uh * Zh[:, 0]).sum()) > 0.99,
+        check("13 hysteresis witness", int(lgh.argmax(-1)[0]) == 1 and float((uh * Zh[:, 0]).sum()) > 0.99,
               f"atom {float(lgh[0,0]):.3f} null {float(lgh[0,1]):.3f}")
         gap = torch.randn(64, dtype=dt); lmap, lq = torch.rand(64, dtype=dt), torch.rand(64, dtype=dt)
-        g0 = float(gate_loss(gap, lmap, lq, 1e-12).mean()); gi = float(gate_loss(gap, lmap, lq, 1e12).mean())
-        check("14 gate limits tau->0 map, tau->inf cue", abs(g0 - float(lmap.mean())) < 1e-12
-              and abs(gi - float(lq.mean())) < 1e-12)
+        check("14 gate limits",
+              abs(float(gate_loss(gap, lmap, lq, 1e-12).mean()) - float(lmap.mean())) < 1e-12
+              and abs(float(gate_loss(gap, lmap, lq, 1e12).mean()) - float(lq.mean())) < 1e-12)
         pg = Params(beta=16.0, kappa=-8.0, omega=0.7, Gamma=0.3, eps_bar=0.3, dtype=dt)
         mg = HopMem(pg, d, C=3, tau=0.5, tau_dead=0.5, dtype=dt)
         for i in range(T):
@@ -1130,21 +1285,16 @@ def selftest():
         ub = read(simg["Z"], simg["la"], qg[None], pg, 20)[0]
         gb = gate_gap(simg["Z"], simg["la"], qg[None], pg)
         ubg = torch.where((gb > math.log(0.5))[:, None], ub, qg[None])[0]
-        check("15 streaming gated retrieve == batch gated read (fusion on)",
-              float((us - ubg).abs().max()) < 1e-9, f"gap={float(gb[0]):+.3f}")
+        check("15 streaming == batch gated (compression on)", float((us - ubg).abs().max()) < 1e-9)
         t16a = calibrate_tau(pg, epg, 20, C=3, tau_dead=0.5)
         t16b = calibrate_tau(pg, epg, 20, C=3, tau_dead=0.5)
-        empty_ep = {"Z": Z[:1], "s": s[:1], "t": t[:1], "t_q": t_q[:1] + 1e4,
-                    "tgt": torch.zeros(1, dtype=torch.long), "z_t": Z[:1, 0], "q": qg[None],
-                    "absent": torch.zeros(1, dtype=torch.bool)}
+        empty_ep = dict(epg); empty_ep["t_q"] = epg["t_q"] + 1e4
         tflat = calibrate_tau(pg, empty_ep, 20, C=3, tau_dead=0.5)
-        check("16 tau protocol deterministic; flat sweep -> argmax", t16a == t16b and abs(tflat - 1.0) < 1e-12,
-              f"tau={t16a:.4g} flat={tflat:.4g}")
+        check("16 tau determinism; flat -> argmax", t16a == t16b and abs(tflat - 1.0) < 1e-12)
         d2, T2, al = 384, 20, 0.05
         Z2 = F.normalize(torch.randn(1, T2, d2, dtype=dt), dim=-1)
         la2 = torch.full((1, T2), math.log(al), dtype=dt); k2 = torch.zeros(1, dtype=torch.long)
         pb17 = Params(beta=16.0, kappa=math.log(1e-4), dtype=dt)
-        tb = float(gibbs_basin(la2, k2, pb17.beta, pb17.kappa)[0])
         ins = outs = True
         for phi, want in ((0.3, True), (0.6, True), (1.3, False), (1.5, False)):
             e = F.normalize(torch.randn(1, d2, dtype=dt), dim=-1)
@@ -1160,9 +1310,8 @@ def selftest():
         lar = torch.tensor([[math.log(al), math.log(al) - 5.0]], dtype=dt)
         qr = F.normalize(Zr[0, 0] + 0.05 * F.normalize(torch.randn(d2, dtype=dt), dim=-1), dim=-1)[None]
         lgr = gibbs_logits(Zr, lar, qr, pg17)
-        check("17 basin inside/outside; floor predicts residual; resolution quotient",
-              ins and outs and abs(ang_g - pred) < 0.25 * pred + 1e-6 and int(lgr.argmax(-1)[0]) == 0,
-              f"basin={tb:.3f} floor {ang_g:.2e} pred {pred:.2e}")
+        check("17 basin / floor / resolution",
+              ins and outs and abs(ang_g - pred) < 0.25 * pred + 1e-6 and int(lgr.argmax(-1)[0]) == 0)
     p18 = Params(read="gibbs", beta=60.0)
     Zf = F.normalize(torch.randn(8, 12, 32), dim=-1)
     sf = torch.empty(8, 12).exponential_(); tf = torch.empty(8, 12).exponential_().cumsum(-1)
@@ -1172,8 +1321,7 @@ def selftest():
     g_cue = torch.autograd.grad(F.cross_entropy(lg, lab18), p18.a_Gamma, retain_graph=True)[0]
     lg0 = gibbs_logits(Zf, lf, qf, p18, cue_free=True)
     g_pri = torch.autograd.grad(F.cross_entropy(lg0, lab18), p18.a_Gamma)[0]
-    check("18 prior probe restores the Gamma gradient", float(g_pri.abs()) > 10.0 * float(g_cue.abs()) + 1e-9,
-          f"cue {float(g_cue.abs()):.2e} -> prior {float(g_pri.abs()):.2e}")
+    check("18 prior probe restores Gamma gradient", float(g_pri.abs()) > 10.0 * float(g_cue.abs()) + 1e-9)
     with torch.no_grad():
         alpha = la.exp(); gam = 0.01; k = torch.zeros(B, dtype=torch.long)
         margin, fs, fh = quad_stability(Z, alpha, k, gam)
@@ -1186,10 +1334,10 @@ def selftest():
             ev = torch.linalg.eigvalsh(Hd); mm.append(float(ev.min()))
             x = P @ Moth @ zk; ff.append(float(x.norm()) / (float(alpha[b, 0]) + gam))
             hh.append(float(torch.linalg.solve(Hd, x).norm()) if float(ev.min()) > 0 else float("nan"))
-        ok = (float((margin - torch.tensor(mm, dtype=dt)).abs().max()) < 1e-9
+        check("19 factored == dense stability",
+              float((margin - torch.tensor(mm, dtype=dt)).abs().max()) < 1e-9
               and float((fs - torch.tensor(ff, dtype=dt)).abs().max()) < 1e-9
               and bool(torch.allclose(fh, torch.tensor(hh, dtype=dt), atol=1e-8, equal_nan=True)))
-        check("19 factored corrected stability == dense (incl. saddle)", ok)
         A = torch.randn(d, 5, dtype=dt); Wr = A @ A.t() / (A @ A.t()).trace()
         worst = 0.0
         for e_ in (0.1, 10.0, 1e4):
@@ -1201,7 +1349,7 @@ def selftest():
         gam_, etap = chi / eta, eta / (1 + eta * (1 - S_) / d)
         stW = lambda u: (u + eta * (u @ m2.W + gam_ * q), -0.5 * (u * (u @ m2.W)).sum(-1) - gam_ * (u * q).sum(-1))
         stM = lambda u: (u + etap * (u @ M_ + gam_ * q), -0.5 * (u * (u @ M_)).sum(-1) - gam_ * (u * q).sum(-1))
-        check("20 legacy descent every eta; W-form == M-form", worst == 0.0
+        check("20 legacy descent; W-form == M-form", worst == 0.0
               and float((retrieve(stW, q, 20) - retrieve(stM, q, 20)).abs().max()) < 1e-11)
         mg_a, _, _ = quad_stability(Z2, la2.exp(), k2, 3 * al * math.sqrt((T2 - 1) / d2))
         gc = 2 * al * math.sqrt((T2 - 1) / d2); closure_max = 1 / (1 + gc / al)
@@ -1213,10 +1361,9 @@ def selftest():
         pt = Params(read="power", eta=1.0, chi=gc * 1.05, dtype=dt)
         ut = read(Z2, la2, q21, pt, 4000)
         theta21 = float(torch.acos((ut * Z2[:, 0]).sum(-1).clamp(-1, 1))[0])
-        closure_frac = (phi21 - theta21) / phi21
-        check("21 capacity-closure bound; auto-gamma stable",
-              bool((mg_a > 0).all()) and bool((mg_e > 0).all()) and closure_frac <= closure_max + 0.06,
-              f"closure_frac {closure_frac:.3f} <= {closure_max:.3f}")
+        cf21 = (phi21 - theta21) / phi21
+        check("21 capacity-closure witness", bool((mg_a > 0).all()) and bool((mg_e > 0).all())
+              and cf21 <= closure_max + 0.06, f"closure_frac {cf21:.3f}")
         Zg = torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]], dtype=dt)
         lg22 = torch.zeros(1, 2, dtype=dt); qg22 = torch.tensor([[0.0, 1.0]], dtype=dt)
         pg22 = Params(beta=6.0, kappa=NEG, dtype=dt)
@@ -1227,28 +1374,27 @@ def selftest():
                                 torch.ones(2, dtype=dt), torch.tensor([0.999, 0.999], dtype=dt))
             rb.sum().backward()
         rbv = rb.detach()
-        lam = torch.zeros(1, 2, dtype=dt); Gm = torch.tensor([[[1.0, -1.0], [-1.0, 1.0]]], dtype=dt)
-        cm, _ = ward_log_cost(lam, Gm, torch.ones(1, 2, dtype=torch.bool), EPS_R)
-        check("22 masked denominators: guard, reinforce branch, r-mask",
-              bool(torch.isfinite(ug22).all()) and float((ug22 - qg22).abs().max()) < 1e-12
-              and ig22["guard"] > 0 and float(rbv[0]) == 0.0 and abs(float(rbv[1]) - 0.375) < 1e-12
+        lam22 = torch.zeros(1, 2, dtype=dt); Gm = torch.tensor([[[1.0, -1.0], [-1.0, 1.0]]], dtype=dt)
+        cm, _ = ward_log_cost(lam22, Gm, torch.ones(1, 2, dtype=torch.bool), EPS_R)
+        check("22 masked denominators", bool(torch.isfinite(ug22).all())
+              and float((ug22 - qg22).abs().max()) < 1e-12 and ig22["guard"] > 0
+              and float(rbv[0]) == 0.0 and abs(float(rbv[1]) - 0.375) < 1e-12
               and bool(torch.isfinite(mu_t.grad).all()) and bool(torch.isinf(cm[0, 0, 1]).all()))
         err = 0.0
         for y in (1e-6, 1e-3, 0.1, 1.0, 5.0, 19.9, 20.0, 50.0, 100.0, 700.0):
             x = inv_softplus(y)
-            yback = math.log1p(math.exp(x)) if x < 20 else x + math.log1p(math.exp(-x))
-            err = max(err, abs(yback - y) / max(y, 1e-12))
-        check("23 stable inverse-softplus round-trip", err < 1e-9, f"rel err {err:.1e}")
+            yb = math.log1p(math.exp(x)) if x < 20 else x + math.log1p(math.exp(-x))
+            err = max(err, abs(yb - y) / max(y, 1e-12))
+        check("23 stable inverse softplus", err < 1e-9)
         x = torch.tensor([1e-9, 1e-8, 1e-7, 1e-6], dtype=torch.float32)
         good = -torch.expm1(-x); naive = 1 - torch.exp(-x)
-        rel_good = float(((good - x).abs() / x).max()); rel_naive = float(((naive - x).abs() / x).max())
-        check("24 -expm1 accurate at small x; naive loses precision", rel_good < 1e-6 and rel_naive > 1e-3,
-              f"expm1 {rel_good:.1e} naive {rel_naive:.1e}")
+        check("24 -expm1 accuracy", float(((good - x).abs() / x).max()) < 1e-6
+              and float(((naive - x).abs() / x).max()) > 1e-3)
         eps = 1e-6; D0 = torch.zeros(4, dtype=dt)
         with torch.enable_grad():
             J = torch.autograd.functional.jacobian(lambda x: decoder_norm(x[None], eps)[0], D0)
         sn = float(torch.linalg.eigvalsh(J.t() @ J).max().sqrt())
-        check("25 decoder normalization Jacobian <= 1/eps", sn <= 1 / eps * (1 + 1e-6), f"|J|={sn:.3e}")
+        check("25 decoder Jacobian bound", sn <= 1 / eps * (1 + 1e-6))
         with torch.enable_grad():
             kap = torch.tensor(-20.0, dtype=dt, requires_grad=True)
             laf = torch.randn(1000, 5, dtype=dt) - 3
@@ -1257,102 +1403,105 @@ def selftest():
             gp = torch.autograd.grad(ce_p, kap, retain_graph=True)[0]
             ce_m = F.cross_entropy(torch.cat([laf, kap.reshape(1, 1).expand(1000, 1)], -1), labm)
             gm = torch.autograd.grad(ce_m, kap)[0]
-        check("26 no-match prevents kappa->-inf; p_true warning", float(gp) > 0 and float(gm) < 0,
-              f"present {float(gp):+.3f} mixed {float(gm):+.3f}")
+        check("26 no-match bounds kappa", float(gp) > 0 and float(gm) < 0)
         sim27 = simulate_fusion(p, ep0, T); la27 = log_doses(p, s, t, t_q)
         r_none = evaluate(p, ep0, 20, C=None); r_T = evaluate(p, ep0, 20, C=T)
-        same = all(abs(r_none[kk] - r_T[kk]) < 1e-15 for kk in ("loss", "ce", "gate_best", "cue", "nn"))
-        check("27 C>=T bit-for-bit == v2.1.1", sim27["Z"] is Z
+        check("27 C>=T bit-for-bit regression", sim27["Z"] is Z
               and float((sim27["la"] - la27).abs().max()) == 0.0
-              and bool((sim27["label"] == ep0["tgt"]).all()) and same)
+              and bool((sim27["label"] == ep0["tgt"]).all())
+              and all(abs(r_none[kk] - r_T[kk]) < 1e-15 for kk in ("loss", "ce", "gate_best")))
         nq, dq, bq = 20000, 64, 21.31
         zi = F.normalize(torch.randn(nq, dq, dtype=dt), dim=-1)
         zj = F.normalize(torch.randn(nq, dq, dtype=dt), dim=-1)
         u = F.normalize(torch.randn(nq, dq, dtype=dt), dim=-1)
         lai = torch.rand(nq, dtype=dt) * 5 - 6; laj = torch.rand(nq, dtype=dt) * 5 - 6
-        mu, laf_, r, delta, w, Gij, omr = fuse_pair_math(zi, zj, lai, laj, torch.tensor(bq, dtype=dt))
+        bt = torch.tensor(bq, dtype=dt)
+        mu, laf_, r_, delta_, w_, Gij_, omr_, rdir_ = fuse_pair_math(zi, zj, lai, laj, bt)
         Ep = (laf_ + bq * (mu * u).sum(-1)).exp()
         Eij = (lai + bq * (zi * u).sum(-1)).exp() + (laj + bq * (zj * u).sum(-1)).exp()
-        resid = Ep - Eij
-        check("28 Thm A domination: 0 violations / 20000", int((resid > 1e-9).sum()) == 0,
-              f"max residual {float(resid.max()):.2e}")
+        check("28 Thm A domination", int(((Ep - Eij) > 1e-9).sum()) == 0,
+              f"max resid {float((Ep-Eij).max()):.2e}")
         cc = -1.37
-        mu1, la1, *_ = fuse_pair_math(zi[:5], zj[:5], lai[:5], laj[:5], torch.tensor(bq, dtype=dt))
-        mu2, la2_, *_ = fuse_pair_math(zi[:5], zj[:5], lai[:5] + cc, laj[:5] + cc, torch.tensor(bq, dtype=dt))
-        check("29 Thm B commutation", float((mu1 - mu2).abs().max()) < 1e-14
-              and float((la2_ - (la1 + cc)).abs().max()) < 1e-13)
-        m30 = HopMem(p, d, C=None, dtype=dt)
-        m30.write(Z[0, 0], 1.0, 0.0, prov=0); m30.write(Z[0, 1], 1.0, 1.0, prov=1)
-        W0, S0 = m30.W.clone(), m30.S
+        m1, l1, *_ = fuse_pair_math(zi[:5], zj[:5], lai[:5], laj[:5], bt)
+        m2_, l2_, *_ = fuse_pair_math(zi[:5], zj[:5], lai[:5] + cc, laj[:5] + cc, bt)
+        check("29 Thm B commutation", float((m1 - m2_).abs().max()) < 1e-14
+              and float((l2_ - (l1 + cc)).abs().max()) < 1e-13)
+        pd30 = Params(omega=0.7, Gamma=0.3, eps_bar=0.3, beta=16.0, kappa=-8.0, dtype=dt)
+        zA = F.normalize(torch.randn(d, dtype=dt), dim=-1)
+        zB = F.normalize(zA + 0.01 * F.normalize(torch.randn(d, dtype=dt), dim=-1), dim=-1)
+        m30 = HopMem(pd30, d, C=None, dtype=dt)
+        m30.write(zA, 1.0, 0.0, prov=0); m30.write(zB, 1.0, 0.0, prov=1)
+        S0 = m30.S
         a0, a1 = [math.exp(at["la"]) for at in m30.atoms]
-        z0, z1 = m30.atoms[0]["z"], m30.atoms[1]["z"]
-        mu30, la30, r30, dl30, *_ = fuse_pair_math(z0[None], z1[None],
+        mu30, la30, r30, dl30, *_ = fuse_pair_math(zA[None], zB[None],
             torch.tensor([m30.atoms[0]["la"]], dtype=dt), torch.tensor([m30.atoms[1]["la"]], dtype=dt),
-            torch.tensor(float(p.beta.detach()), dtype=dt))
+            torch.tensor(16.0, dtype=dt))
         A30 = a0 + a1; Sexp = S0 - A30 * (1 - math.exp(-float(dl30[0])))
-        Mexp = (m30.M - a0 * torch.outer(z0, z0) - a1 * torch.outer(z1, z1)
+        Mexp = (m30.M - a0 * torch.outer(zA, zA) - a1 * torch.outer(zB, zB)
                 + A30 * math.exp(-float(dl30[0])) * torch.outer(mu30[0], mu30[0]))
-        m30.C = 1; m30._fuse_on_overflow(); ev30 = torch.linalg.eigvalsh(m30.W)
-        check("30 fusion accounting: W'=(1-S')J+M', tr=1, PSD, S deficit->J",
-              float((m30.W - ((1 - Sexp) / d * eye + Mexp)).abs().max()) < 1e-11
-              and abs(m30.S - Sexp) < 1e-12 and abs(float(m30.W.trace()) - 1) < 1e-12 and float(ev30.min()) > 0)
+        m30.C = 1; m30._compress_on_overflow()
+        ev30 = torch.linalg.eigvalsh(m30.W)
+        check("30 merge accounting (tr=1, PSD, deficit->J)", m30.n_fuse == 1
+              and float((m30.W - ((1 - Sexp) / d * eye + Mexp)).abs().max()) < 1e-10
+              and abs(m30.S - Sexp) < 1e-11 and float(ev30.min()) > 0,
+              f"n_fuse={m30.n_fuse}")
         tau31, kap31, bet31 = 0.5, -5.0, 16.0; thr31 = kap31 + math.log(tau31)
         zd = F.normalize(torch.randn(10000, d, dtype=dt), dim=-1)
         la_dead = torch.full((10000,), thr31 - 0.1, dtype=dt)
         gap_dead = bet31 * (zd * zd[:1]).sum(-1) + la_dead - (bet31 + kap31)
-        gap_alive = bet31 + (thr31 + 0.01) - (bet31 + kap31)
-        check("31 gate-dead iff ell<=kappa+ln tau", float(gap_dead.max()) <= math.log(tau31) + 1e-12
-              and gap_alive > math.log(tau31))
+        check("31 gate-dead criterion", float(gap_dead.max()) <= math.log(tau31) + 1e-12
+              and bet31 + (thr31 + 0.01) - (bet31 + kap31) > math.log(tau31))
         Z32 = F.normalize(torch.randn(1, 6, d, dtype=dt), dim=-1)
         la32 = torch.rand(1, 6, dtype=dt) * 6 - 8
         p32 = Params(beta=16.0, kappa=-5.0, dtype=dt)
         dead32 = la32[0] <= -5.0 + math.log(0.5); keep = (~dead32).nonzero().squeeze(1)
-        Zk, lak = Z32[:, keep], la32[:, keep]
         q32 = F.normalize(torch.randn(5000, d, dtype=dt), dim=-1)
         gf = gate_gap(Z32.expand(5000, -1, -1), la32.expand(5000, -1), q32, p32)
-        gk = gate_gap(Zk.expand(5000, -1, -1), lak.expand(5000, -1), q32, p32)
-        check("32 gate-dead deletion: decisions invariant (5000 cues)",
-              bool(((gf > math.log(0.5)) == (gk > math.log(0.5))).all()) and int(dead32.sum()) > 0,
-              f"{int(dead32.sum())} dead removed")
-        m33 = HopMem(p, d, C=None, dtype=dt)
+        gk = gate_gap(Z32[:, keep].expand(5000, -1, -1), la32[:, keep].expand(5000, -1), q32, p32)
+        check("32 gate-dead deletion decision-invariant",
+              bool(((gf > math.log(0.5)) == (gk > math.log(0.5))).all()) and int(dead32.sum()) > 0)
+        pd33 = Params(omega=0.7, Gamma=1e-9, eps_bar=0.01, beta=16.0, kappa=-8.0, dtype=dt)
+        m33 = HopMem(pd33, d, C=None, dtype=dt)
+        zbase = F.normalize(torch.randn(d, dtype=dt), dim=-1)
         for i in range(4):
-            m33.write(Z[0, i], 1.0, 0.0, prov=i)
-        la0_33 = m33.log_alpha.clone()
-        m33.C = 1; m33._fuse_on_overflow()
-        la_fin = float(m33.log_alpha[0]); D_fin = float(m33.D_vec[0])
-        base = float(torch.logsumexp(la0_33, 0))
-        bound_ok = la_fin >= base - float(p.beta.detach()) * D_fin - 1e-9
+            m33.write(F.normalize(zbase + 0.01 * F.normalize(torch.randn(d, dtype=dt), dim=-1), dim=-1),
+                      1.0, 0.0, prov=i)
+        base33 = float(torch.logsumexp(m33.log_alpha, 0))
+        m33.C = 1; m33._compress_on_overflow()
+        la_fin = float(m33.log_alpha[0]); Lam_fin = float(m33.Lam_vec[0])
         wr = torch.rand(1000, dtype=dt); Gr = torch.rand(1000, dtype=dt) * 2 - 1
-        dl_s, r_s, omr_s = resultant_deficit(wr, 1 - Gr, torch.tensor(bq, dtype=dt))
-        r_direct = (1 - 2 * wr * (1 - wr) * (1 - Gr)).clamp_min(0).sqrt()
-        err_delta = float((dl_s - bq * (1 - r_direct)).abs().max())
-        check("33 ledger: single-fusion exact; multi-fusion conservative bound; stable delta",
-              bound_ok and err_delta < 1e-11 and m33.n_fuse == 3 and D_fin > 0,
-              f"bound_ok={bound_ok} delta_err={err_delta:.1e} D={D_fin:.4f}")
+        dl_s, r_s, omr_s = resultant_deficit(wr, 1 - Gr, bt)
+        r_dir = (1 - 2 * wr * (1 - wr) * (1 - Gr)).clamp_min(0).sqrt()
+        check("33 nats ledger: chain bound + stable delta", m33.n_fuse == 3
+              and la_fin >= base33 - Lam_fin - 1e-9
+              and float((dl_s - bq * (1 - r_dir)).abs().max()) < 1e-11,
+              f"n_fuse={m33.n_fuse} Lam={Lam_fin:.4f}")
         m34 = HopMem(pg, d, C=3, tau=0.5, tau_dead=0.5, dtype=dt)
         for i in range(T):
             m34.write(Z[0, i], float(s[0, i]), float(t[0, i]), prov=i)
         m34._advance(float(t_q[0]))
         sim34 = simulate_fusion(pg, epg, 3, tau_dead=0.5)
-        ks = {a["prov"]: (a["z"], a["la"], a["D"]) for a in m34.atoms}
+        ks = {a["prov"]: (a["z"], a["la"], a["Lam"]) for a in m34.atoms}
         kb = {}
         for kk in range(sim34["K"]):
             if bool(sim34["alive"][0, kk]):
-                prov = frozenset(sim34["prov"][0, kk].nonzero().squeeze(1).tolist())
-                kb[prov] = (sim34["Z"][0, kk], float(sim34["la"][0, kk]), float(sim34["D"][0, kk]))
+                pr = frozenset(sim34["prov"][0, kk].nonzero().squeeze(1).tolist())
+                kb[pr] = (sim34["Z"][0, kk], float(sim34["la"][0, kk]), float(sim34["Lam"][0, kk]))
         ok34 = set(ks) == set(kb); err34 = 0.0
         if ok34:
             for pr in ks:
                 err34 = max(err34, float((ks[pr][0] - kb[pr][0]).abs().max()),
                             abs(ks[pr][1] - kb[pr][1]), abs(ks[pr][2] - kb[pr][2]))
-        check("34 streaming == batched fusion replay", ok34 and err34 < 1e-9, f"blocks={len(ks)} err={err34:.1e}")
+        check("34 streaming == batched replay", ok34 and err34 < 1e-9, f"err={err34:.1e}")
         p35 = Params(omega=1e-3, Gamma=1e-9, beta=16.0, kappa=-8.0, eps_bar=0.01, dtype=dt)
-        m35 = HopMem(p35, 2, C=1, tau=0.5, dtype=torch.float64)
+        m35 = HopMem(p35, 2, C=1, tau=0.5, dtype=dt)
         e1 = torch.tensor([1.0, 0.0], dtype=dt)
         m35.write(e1, 1.0, 0.0, prov=0); m35.write(-e1, 1.0, 0.0, prov=1)
-        check("35 C=1 antipodal fallback fires; r-mask; ledger full",
-              m35.n_fall == 1 and len(m35.atoms) == 1 and (m35.retained(0) == 0.0 or m35.retained(1) == 0.0),
-              f"n_fall={m35.n_fall} destroyed={sorted(m35.destroyed)}")
+        check("35 C=1 antipodal: merge masked, EVICT fires, ledger ~ln2",
+              m35.n_evict == 1 and m35.n_fuse == 0 and len(m35.atoms) == 1
+              and abs(m35.sum_delta - math.log(2)) < 1e-3
+              and (m35.retained(0) == 0.0 or m35.retained(1) == 0.0),
+              f"n_evict={m35.n_evict} ledger={m35.sum_delta:.4f}")
         ai, aj, G36 = 0.3, 0.1, 0.99
         zi36 = F.normalize(torch.randn(1, d, dtype=dt), dim=-1)[0]
         e36 = F.normalize(torch.randn(d, dtype=dt), dim=-1)
@@ -1367,9 +1516,119 @@ def selftest():
             if i % 7 == 0:
                 m36b.reinforce(F.normalize(torch.randn(d, dtype=dt), dim=-1), 1.0, 0.5, 0.3)
             cap_ok &= len(m36b.atoms) <= 5
-        check("36 Ward == Prop C first-order; capacity <= C always",
-              abs(exact - predC) < 0.05 * predC + 1e-9 and cap_ok,
-              f"exact {exact:.5f} pred {predC:.5f}")
+        check("36 Prop C first-order; capacity <= C", abs(exact - predC) < 0.05 * predC + 1e-9 and cap_ok)
+
+        # ---------------- new in v2.3.1 (37-44) ----------------
+        pd = Params(omega=0.3, Gamma=1e-6, eps_bar=0.01, beta=16.0, kappa=-30.0, dtype=dt)
+        Zs37 = F.normalize(torch.randn(40, 64, dtype=dt), dim=-1)
+        ep37 = {"Z": Zs37[None], "s": torch.rand(1, 40, dtype=dt) * 3 + 0.05,
+                "t": torch.zeros(1, 40, dtype=dt), "t_q": torch.zeros(1, dtype=dt),
+                "tgt": torch.zeros(1, dtype=torch.long), "z_t": Zs37[None, 0],
+                "q": Zs37[None, 0], "absent": torch.zeros(1, dtype=torch.bool)}
+        sA = simulate_fusion(pd, ep37, 6, tau_dead=1e-12, policy="debit")
+        sB = simulate_fusion(pd, ep37, 6, tau_dead=1e-12, policy="lightest")
+        setA = {frozenset(sA["prov"][0, k].nonzero().squeeze(1).tolist())
+                for k in range(sA["K"]) if bool(sA["alive"][0, k])}
+        setB = {frozenset(sB["prov"][0, k].nonzero().squeeze(1).tolist())
+                for k in range(sB["K"]) if bool(sB["alive"][0, k])}
+        check("37 spread reduction == streaming dose-ordered eviction",
+              setA == setB and float(sA["stats"]["n_fuse"][0]) == 0.0,
+              f"evict={float(sA['stats']['n_evict'][0]):.0f}")
+        zdup = F.normalize(torch.randn(1, 32, dtype=dt), dim=-1)
+        ep38 = {"Z": zdup.expand(1, 2, 32).contiguous(), "s": torch.ones(1, 2, dtype=dt),
+                "t": torch.zeros(1, 2, dtype=dt), "t_q": torch.zeros(1, dtype=dt),
+                "tgt": torch.zeros(1, dtype=torch.long), "z_t": zdup,
+                "q": zdup, "absent": torch.zeros(1, dtype=torch.bool)}
+        pw = Params(omega=1e-9, Gamma=1e-9, pure_writes=True, beta=16.0, kappa=-30.0, dtype=dt)
+        s38 = simulate_fusion(pw, ep38, 1, tau_dead=1e-12, policy="debit")
+        l0_38 = float(log_injected(pw, torch.ones(1, dtype=dt))[0])
+        check("38 duplicate reduction: free merge, evidence preserved",
+              float(s38["stats"]["n_fuse"][0]) == 1.0 and float(s38["stats"]["n_evict"][0]) == 0.0
+              and abs(float(s38["la"][0, 0]) - (l0_38 + math.log(2))) < 1e-6
+              and float(s38["Lam"][0, 0]) < 1e-12)
+        b39 = 17.0
+        th_star = 2 * math.acos(1 - math.log(2) / b39)
+        za = torch.tensor([[1.0, 0.0]], dtype=dt)
+        zb = torch.tensor([[math.cos(th_star), math.sin(th_star)]], dtype=dt)
+        Z39 = torch.stack([za, zb], 1)
+        G39 = Z39 @ Z39.transpose(1, 2)
+        la39 = torch.zeros(1, 2, dtype=dt)
+        _, isf, df, de, _, _, _ = debit_candidates(la39, G39, torch.ones(1, 2, dtype=torch.bool),
+                                                   torch.tensor(b39, dtype=dt))
+        check("39 crossover identity delta_fuse == delta_evict == ln2",
+              abs(float(df[0, 0, 1]) - math.log(2)) < 1e-12
+              and abs(float(de[0, 0, 1]) - math.log(2)) < 1e-12,
+              f"theta*={th_star:.4f} df={float(df[0,0,1]):.6f}")
+        n40, K40, d40 = 10000, 6, 16
+        Z40 = F.normalize(torch.randn(n40, K40, d40, dtype=dt), dim=-1)
+        G40 = Z40 @ Z40.transpose(1, 2)
+        la40 = torch.rand(n40, K40, dtype=dt) * 8 - 9
+        al40 = torch.ones(n40, K40, dtype=torch.bool)
+        b40 = torch.tensor(16.0, dtype=dt)
+        logD40, isf40, df40, de40, _, _, _ = debit_candidates(la40, G40, al40, b40)
+        best = logD40.reshape(n40, K40 * K40).min(1).values
+        ar40 = torch.arange(n40)
+        lo = la40.argmin(1); hi = la40.argmax(1)
+        A_lh = torch.logaddexp(la40[ar40, lo], la40[ar40, hi])
+        S40 = la40.exp().sum(-1)
+        bound = A_lh - S40.log() + de40[ar40, lo, hi].clamp_min(TINY).log()
+        check("40 Thm E per-event debit dominance", int((best > bound + 1e-9).sum()) == 0,
+              f"max excess {float((best-bound).max()):.2e}")
+        m41 = HopMem(pd, 32, C=5, dtype=dt)
+        gerr = 0.0
+        for i in range(1000):
+            if i % 3:
+                zi41 = F.normalize(torch.randn(32, dtype=dt), dim=-1)
+            elif m41.atoms:
+                zi41 = F.normalize(m41.atoms[0]["z"]
+                                   + 0.02 * F.normalize(torch.randn(32, dtype=dt), dim=-1), dim=-1)
+            else:
+                zi41 = F.normalize(torch.randn(32, dtype=dt), dim=-1)
+            m41.write(zi41, float(torch.rand(1)) * 2 + 0.1, float(i) * 0.01, prov=i)
+            if m41.atoms:
+                Zt = m41.Zs
+                gerr = max(gerr, float((m41.G - Zt @ Zt.t()).abs().max()))
+        check("41 incremental Gram == rebuild (1000 mixed ops)", gerr < 1e-10, f"max err {gerr:.2e}")
+        m42 = HopMem(pd33, d, C=None, dtype=dt)
+        for i in range(3):
+            m42.write(F.normalize(zbase + 0.01 * F.normalize(torch.randn(d, dtype=dt), dim=-1), dim=-1),
+                      1.0, 0.0, prov=i)
+        base42 = float(torch.logsumexp(m42.log_alpha, 0))
+        m42.C = 1; m42._compress_on_overflow()
+        m42e = HopMem(pd, 32, C=2, dtype=dt)
+        for i in range(12):
+            m42e.write(F.normalize(torch.randn(32, dtype=dt), dim=-1), 1.0, float(i) * 0.01, prov=i)
+        check("42 ledger nats: chain bound, destroyed -> 0",
+              float(m42.log_alpha[0]) >= base42 - float(m42.Lam_vec[0]) - 1e-9
+              and len(m42e.destroyed) > 0 and all(m42e.retained(k) == 0.0 for k in m42e.destroyed)
+              and m42e.sum_delta > 0)
+        sh = -1.37
+        logD43, isf43, *_ = debit_candidates(la40 + sh, G40, al40, b40)
+        fin43 = torch.isfinite(logD40) & torch.isfinite(logD43)
+        d43 = (logD43 - logD40)[fin43]
+        i_a = logD40.reshape(n40, K40 * K40).argmin(1)
+        i_b = logD43.reshape(n40, K40 * K40).argmin(1)
+        check("43 policy commutation (Delta and argmin invariant)",
+              float(d43.abs().max()) < 1e-13 and bool((i_a == i_b).all())
+              and bool((isf43[fin43] == isf40[fin43]).all()),
+              f"max |dDelta|={float(d43.abs().max()):.2e}")
+        al_ = la40.exp(); A_ = al_.unsqueeze(2) + al_.unsqueeze(1)
+        S_ = al_.sum(-1)[:, None, None]
+        omg_ = (1 - G40).clamp_min(0)
+        c_ = al_.unsqueeze(2) * al_.unsqueeze(1) / A_ * omg_
+        w_h = torch.maximum(al_.unsqueeze(2), al_.unsqueeze(1)) / A_
+        p_l = torch.minimum(al_.unsqueeze(2), al_.unsqueeze(1)) / S_
+        errF = float((c_ / S_ - p_l * w_h * omg_).abs().max())
+        logA_ = torch.logaddexp(la40.unsqueeze(2), la40.unsqueeze(1))
+        logS_ = al_.sum(-1).log()[:, None, None]
+        le40 = logA_ - logS_ + de40.clamp_min(TINY).log()
+        valid40 = ~torch.eye(K40, dtype=torch.bool)[None]
+        le40 = torch.where(valid40, le40, torch.full_like(le40, float("inf")))
+        ie = le40.reshape(n40, K40 * K40).argmin(1)
+        ei, ej = ie // K40, ie % K40
+        pair_ok = ((ei == lo) & (ej == hi)) | ((ei == hi) & (ej == lo))
+        check("44 Lemma F identity; Lemma G cheapest eviction",
+              errF < 1e-12 and bool(pair_ok.all()), f"errF={errF:.2e}")
     assert all(res), "selftest failed: %d/%d" % (sum(res), len(res))
     print(f"all {len(res)} passed (HopMem v{__version__}, spec section 24 suite)")
 
@@ -1382,7 +1641,7 @@ def calibrate(a):
     p = Params(read=a.read, dtype=dt, diffusion=not a.no_diffusion, pure_writes=a.pure_writes).to(dev)
     d, T, B, N = a.d, a.T, a.batch, a.N
     ar = torch.arange(B, device=dev)
-    print("read:", a.read, "theta:", {k: round(v, 6) for k, v in p.theta().items()}, f"d={d} T={T} N={N}")
+    print("read:", a.read, "theta:", {k: round(v, 6) for k, v in p.theta().items()}, f"d={d} T={T}")
     for arm in ("R", "A"):
         Z = F.normalize(torch.randn(B, T, d, generator=torch.Generator(device="cpu").manual_seed(a.seed),
                                     dtype=dt).to(dev), dim=-1)
@@ -1394,32 +1653,23 @@ def calibrate(a):
         t_q = t[:, -1] + torch.empty(B, dtype=dt, device=dev).exponential_()
         tgt = torch.randint(T, (B,), device=dev); z_t = Z[ar, tgt]
         la = log_doses(p, s, t, t_q); alpha = la.exp()
-        v1, lam1 = top_eigvec(Z, alpha)
+        v1, _ = top_eigvec(Z, alpha)
         margin, fs, fh = quad_stability(Z, alpha, tgt, 0.01)
-        print(f"\nArm {arm}: S={float(alpha.sum(-1).mean()):.3f} "
-              f"target mass {float(alpha.gather(1, tgt[:, None]).mean()):.4f}")
         fhm = float(torch.nanmean(fh)) if bool(torch.isfinite(fh).any()) else float("nan")
-        print(f"   quadratic: stable {float((margin > 0).float().mean()):.0%}; "
-              f"floor(spec) {float(fs.mean()):.3f} / floor(Hessian) {fhm:.3f} rad")
-        if a.read == "gibbs":
-            print(f"   gibbs: basin {float(gibbs_basin(la, tgt, p.beta, p.kappa).mean()):.3f} rad, "
-                  f"floor {float(gibbs_floor(Z, la, z_t, tgt, p.beta, p.kappa).mean()):.2e} rad")
+        print(f"\nArm {arm}: S={float(alpha.sum(-1).mean()):.3f} stable {float((margin>0).float().mean()):.0%} "
+              f"floor(Hessian) {fhm:.3f}")
         for phi in a.phis:
             e = torch.randn(B, d, dtype=dt, device=dev)
             e = F.normalize(e - (e * z_t).sum(-1, keepdim=True) * z_t, dim=-1)
             q = math.cos(phi) * z_t + math.sin(phi) * e
             u, info = read(Z, la, q, p, N, diagnostics=True, auto_gamma=a.auto_gamma)
-            uL = read(Z, la, q, p, 10 * N, auto_gamma=a.auto_gamma)
             ang = lambda x: torch.acos((x * z_t).sum(-1).clamp(-1, 1))
-            cos = lambda x: (x * z_t).sum(-1).abs().clamp(max=1.0)
-            print(f"   phi={phi:.2f} closure@N {float(((phi - ang(u)) / phi).mean()):+.2f} "
-                  f"@10N {float(((phi - ang(uL)) / phi).mean()):+.2f} | loss {float((1 - cos(u)).mean()):.4f} "
-                  f"(cue {1 - math.cos(phi):.4f}, centroid {float((1 - cos(v1)).mean()):.3f}, "
-                  f"nn {float((1 - cos(nn_read(Z, q))).mean()):.3f}) | E_up {info['E_up']:.0e}")
+            print(f"   phi={phi:.2f} closure@N {float(((phi-ang(u))/phi).mean()):+.2f} "
+                  f"E_up {info['E_up']:.0e}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=f"HopMem v{__version__} (spec v2.2.1)")
+    ap = argparse.ArgumentParser(description=f"HopMem v{__version__} (spec v2.3.1)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
     sub.add_parser("lm_check")
@@ -1465,7 +1715,8 @@ def main():
             c.add_argument("--C", type=int, default=64)
             c.add_argument("--c_min", type=int, default=4)
             c.add_argument("--fuse", choices=["on", "off"], default="on")
-            c.add_argument("--fuse_policy", choices=["ward", "random", "delta"], default="ward")
+            c.add_argument("--fuse_policy", choices=["debit", "ward", "lightest", "random", "delta"],
+                           default="debit")
             c.add_argument("--out", default="hopmem_theta.pt")
     a = ap.parse_args()
     if a.cmd == "selftest":

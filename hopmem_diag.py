@@ -1,20 +1,11 @@
 #!/usr/bin/env python
-"""hopmem_diag.py v2.2.1 -- add-on for hopmem.py (imports it, changes nothing in it).
+"""hopmem_diag.py v2.3.1 -- add-on for hopmem.py.
 
-    python hopmem_diag.py --ckpt hopmem_theta.pt                 # real cached corpus
-    python hopmem_diag.py --ckpt hopmem_theta.pt --synthetic     # no network
-    python hopmem_diag.py --ckpt hopmem_theta.pt --same_passage
-
-Sections:
- 1. DECOMPOSED BASELINES incl. kNN + one train-fit threshold (like-for-like gate comparator).
- 2. PRIOR QUALITY: cue-free CE of learned log-doses vs the generating oracle (kappa re-fit).
- 3. TOP-k EVICTION (the v2.1.1 capacity map, retained as the broken comparator).
- 4. FUSION CAPACITY REGIME (spec 17.6): stream T_big writes through the fusion loop, sweep C,
-    report decomposed present/absent loss, per-target retained evidence e^{-beta D}, block
-    angular distortion, ledger sum(delta), gate-dead deletions, below-resolution fraction,
-    ECE under load, the monotone mass-gate ablation, and a per-C tau recalibration diagnostic
-    (train batch only -- never deployed).
- 5. UNIT THEOREM spot-checks: evidence domination (Thm A), commutation (Thm B), stable delta.
+ 1 decomposed baselines (incl. kNN + train-fit threshold)
+ 2 cue-free prior CE vs oracle
+ 3/4 capacity sweep: debit policy vs ward (v2.2.1) vs streaming-lightest vs offline top-k
+ 5 duplicate-heavy sweep (spec 17.6 prediction ii)
+ 6 unit theorem spot-checks
 """
 import argparse
 import math
@@ -37,6 +28,7 @@ def main():
     ap.add_argument("--ckpt", default="hopmem_theta.pt")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--same_passage", action="store_true")
+    ap.add_argument("--dup_sweep", action="store_true")
     ap.add_argument("--T", type=int, default=20)
     ap.add_argument("--T_big", type=int, default=100)
     ap.add_argument("--caps", type=int, nargs="+", default=[4, 8, 16, 32])
@@ -59,9 +51,9 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(a.seed)
     p, tau, cfg = H.load_checkpoint(a.ckpt, dev)
-    assert p.read == "gibbs", "diagnostics need the gibbs readout"
     N, lam, pa = cfg.get("N", 20), cfg.get("query_decay", 0.2), cfg.get("p_absent", 0.2)
     thr = math.log(tau if tau is not None else 1.0)
+    pol = cfg.get("fuse_policy", "debit")
     Zs, Qs, doc = H.synthetic_corpus(a) if a.synthetic else H.build_corpus(a)
     Zs, Qs = Zs.to(dev), Qs.to(dev)
     P = len(Zs)
@@ -71,9 +63,8 @@ def main():
     kw = dict(same_passage=a.same_passage, query_decay=lam, p_absent=pa)
     tr = H.EpisodeSampler(Zs[:cut], Qs[:cut], doc[:cut], T=a.T, **kw)
     ev = H.EpisodeSampler(Zs[cut:], Qs[cut:], doc[cut:], T=a.T, **kw)
-    print(f"items {P}, d={Zs.shape[1]}, train {cut}/eval {P-cut}; ckpt v{cfg.get('version','?')} "
-          f"tau={tau} C={cfg.get('C')} beta={float(p.beta):.2f} kappa={float(p.kappa):.2f} "
-          f"omega={float(p.omega):.4f} Gamma={float(p.Gamma):.4f}")
+    print(f"items {P}, d={Zs.shape[1]}; ckpt v{cfg.get('version','?')} tau={tau} C={cfg.get('C')} "
+          f"policy={pol} beta={float(p.beta):.2f} kappa={float(p.kappa):.2f}")
 
     def parts(ep):
         la = H.log_doses(p, ep["s"], ep["t"], ep["t_q"])
@@ -90,12 +81,12 @@ def main():
     th = float(grid[torch.stack([torch.where(cal["cmax"] > g, cal["lnn"], cal["lq"]).mean()
                                  for g in grid]).argmin()])
     r, ab = parts(e), e["absent"]
-    print("\n1. deployed vs baselines (eval, C>=T), split present / absent")
+    print("\n1. deployed vs baselines (eval, C>=T), present / absent")
     row("map (ungated)", r["lmap"], ab)
     row(f"gate (saved tau={tau})", torch.where(r["gap"] > thr, r["lmap"], r["lq"]), ab)
     row("cue-only", r["lq"], ab)
-    row("nearest-neighbour (forced commit)", r["lnn"], ab)
-    row(f"kNN + threshold (cos > {th:.3f}, train-fit)", torch.where(r["cmax"] > th, r["lnn"], r["lq"]), ab)
+    row("kNN (forced commit)", r["lnn"], ab)
+    row(f"kNN + threshold (cos > {th:.3f})", torch.where(r["cmax"] > th, r["lnn"], r["lq"]), ab)
 
     c = tr.sample(a.cal_batch)
     la, tgt, B = H.log_doses(p, c["s"], c["t"], c["t_q"]), c["tgt"], len(c["tgt"])
@@ -106,11 +97,9 @@ def main():
     kg = torch.linspace(-14, 0, 57, device=dev)
     ces = torch.stack([torch.nn.functional.cross_entropy(
         torch.cat([la, torch.full((B, 1), float(k), device=dev)], -1), tgt) for k in kg])
-    print(f"\n2. cue-free prior CE: oracle {ce_or:.4f} | learned (kappa re-fit "
-          f"{float(kg[ces.argmin()]):.2f}) {float(ces.min()):.4f} | gap {float(ces.min())-ce_or:+.4f} nats")
+    print(f"\n2. prior CE: oracle {ce_or:.4f} | learned {float(ces.min()):.4f} | "
+          f"gap {float(ces.min())-ce_or:+.4f} nats")
 
-    big_tr = H.EpisodeSampler(Zs[:cut], Qs[:cut], doc[:cut], T=a.T_big, same_passage=False,
-                              query_decay=lam, p_absent=pa)
     big_ev = H.EpisodeSampler(Zs[cut:], Qs[cut:], doc[cut:], T=a.T_big, same_passage=False,
                               query_decay=lam, p_absent=pa)
     g = big_ev.sample(a.evict_batch)
@@ -118,15 +107,14 @@ def main():
     lq = 1 - cosabs(g["q"], g["z_t"])
     scores = {"learned": lag, "recency": g["t"], "random": torch.rand_like(lag),
               "oracle": torch.log(g["s"]) - lam * (g["t_q"][:, None] - g["t"])}
-    print(f"\n3/4. capacity: T_big={a.T_big} writes, budget C (matrix memory d^2={d*d} floats)")
-    print(f"   {'C':>4} {'policy':>14} {'present':>8} {'absent':>8} {'kept/ret':>8} {'ledger':>8} {'ECE':>6}")
+    print(f"\n3/4. capacity: T_big={a.T_big}, budget C")
+    print(f"   {'C':>4} {'policy':>16} {'present':>8} {'absent':>8} {'ret/kept':>8} {'ledger':>8} {'evict':>6}")
     for C in a.caps:
-        rf = H.evaluate(p, g, N, tau=tau, C=C, tau_dead=(tau if tau is not None else 1.0))
-        print(f"   {C:>4} {'FUSION':>14} {rf.get('gate_pres',float('nan')):>8.4f} "
-              f"{rf.get('gate_abs',float('nan')):>8.4f} {rf.get('retained',float('nan')):>8.3f} "
-              f"{rf.get('ledger',float('nan')):>8.3f} {rf.get('ece',float('nan')):>6.3f}  "
-              f"(surv {1-rf.get('destroyed_frac',0):.3f}, below-res {rf.get('below_frac',0):.0%}, "
-              f"mass-gate {rf.get('mass_gate_best',float('nan')):.4f})")
+        for name, pp in (("DEBIT", "debit"), ("ward(v2.2.1)", "ward"), ("stream-lightest", "lightest")):
+            rf = H.evaluate(p, g, N, tau=tau, C=C, tau_dead=(tau if tau is not None else 1.0), policy=pp)
+            print(f"   {C:>4} {name:>16} {rf.get('gate_pres',float('nan')):>8.4f} "
+                  f"{rf.get('gate_abs',float('nan')):>8.4f} {rf.get('retained',float('nan')):>8.3f} "
+                  f"{rf.get('ledger',float('nan')):>8.3f} {rf.get('evict_n',float('nan')):>6.1f}")
         for name, sc in scores.items():
             keep = sc.topk(C, -1).indices
             ret = (keep == g["tgt"][:, None]).any(-1)[pres].float().mean()
@@ -134,15 +122,32 @@ def main():
             lak = lag.gather(1, keep)
             u, gap = H.read(Zk, lak, g["q"], p, N), H.gate_gap(Zk, lak, g["q"], p)
             lg = torch.where(gap > thr, 1 - cosabs(u, g["z_t"]), lq)
-            print(f"   {C:>4} {'topk-'+name:>14} {lg[pres].mean():>8.4f} {lg[~pres].mean():>8.4f} "
+            print(f"   {C:>4} {'topk-'+name:>16} {lg[pres].mean():>8.4f} {lg[~pres].mean():>8.4f} "
                   f"{ret:>8.3f}")
-        gt = big_tr.sample(a.cal_batch)
-        tau_C = H.calibrate_tau(p, gt, N, C=C, tau_dead=(tau if tau is not None else 1.0))
-        rf2 = H.evaluate(p, g, N, tau=tau_C, C=C, tau_dead=(tau if tau is not None else 1.0))
-        print(f"        per-C train tau={tau_C:.3g} -> present {rf2.get('gate_pres',float('nan')):.4f} "
-              f"absent {rf2.get('gate_abs',float('nan')):.4f} (diagnostic; deployed tau={tau})")
 
-    print("\n5. unit theorem spot-checks (float64)")
+    if a.dup_sweep:
+        b_ = float(p.beta)
+        th_star = 2 * math.acos(max(-1.0, 1 - math.log(2) / b_)) if b_ > math.log(2) / 2 else math.pi
+        C = max(4, min(a.caps) if a.caps else 8)
+        print(f"\n5. duplicate-heavy sweep (theta*={th_star:.3f}, copies at theta*/4), C={C}")
+        print(f"   {'rho_dup':>8} {'debit pres':>11} {'ward pres':>10} {'topk pres':>10} {'merges':>7}")
+        for rd in (0.0, 0.25, 0.5, 0.75):
+            epd = H.dup_episodes(Zs[cut:], Qs[cut:], 256, a.T_big, rd, th_star / 4,
+                                 lam=lam, p_absent=pa, device=dev)
+            prd = epd["tgt"] < a.T_big
+            rdeb = H.evaluate(p, epd, N, tau=tau, C=C, tau_dead=(tau or 1.0), policy="debit")
+            rward = H.evaluate(p, epd, N, tau=tau, C=C, tau_dead=(tau or 1.0), policy="ward")
+            lad = H.log_doses(p, epd["s"], epd["t"], epd["t_q"])
+            keep = lad.topk(C, -1).indices
+            Zk = epd["Z"].gather(1, keep[..., None].expand(-1, -1, d))
+            lak = lad.gather(1, keep)
+            u, gap = H.read(Zk, lak, epd["q"], p, N), H.gate_gap(Zk, lak, epd["q"], p)
+            lg = torch.where(gap > thr, 1 - cosabs(u, epd["z_t"]), 1 - cosabs(epd["q"], epd["z_t"]))
+            print(f"   {rd:>8.2f} {rdeb.get('gate_pres',float('nan')):>11.4f} "
+                  f"{rward.get('gate_pres',float('nan')):>10.4f} {lg[prd].mean():>10.4f} "
+                  f"{rdeb.get('fuse_n',float('nan')):>7.1f}")
+
+    print("\n6. unit theorem spot-checks (float64)")
     dt = torch.float64
     nq, dq, bq = 20000, 64, float(p.beta)
     zi = torch.nn.functional.normalize(torch.randn(nq, dq, dtype=dt), dim=-1)
@@ -150,15 +155,15 @@ def main():
     u = torch.nn.functional.normalize(torch.randn(nq, dq, dtype=dt), dim=-1)
     lai = torch.rand(nq, dtype=dt) * 5 - 6
     laj = torch.rand(nq, dtype=dt) * 5 - 6
-    mu, laf, r, delta, w, Gij, omr = H.fuse_pair_math(zi, zj, lai, laj, torch.tensor(bq, dtype=dt))
+    bt = torch.tensor(bq, dtype=dt)
+    mu, laf, r, delta, w, Gij, omr, rdir = H.fuse_pair_math(zi, zj, lai, laj, bt)
     Ep = (laf + bq * (mu * u).sum(-1)).exp()
     Eij = (lai + bq * (zi * u).sum(-1)).exp() + (laj + bq * (zj * u).sum(-1)).exp()
-    print(f"   Thm A domination: violations {int(((Ep-Eij)>1e-9).sum())}/{nq}, max resid {float((Ep-Eij).max()):.2e}")
-    cc = -1.37
-    m1, l1, *_ = H.fuse_pair_math(zi[:5], zj[:5], lai[:5], laj[:5], torch.tensor(bq, dtype=dt))
-    m2, l2, *_ = H.fuse_pair_math(zi[:5], zj[:5], lai[:5] + cc, laj[:5] + cc, torch.tensor(bq, dtype=dt))
-    print(f"   Thm B commutation: mu err {float((m1-m2).abs().max()):.1e}, ell err {float((l2-(l1+cc)).abs().max()):.1e}")
-    print(f"   stable delta == beta(1-r): err {float((delta-bq*omr).abs().max()):.1e}")
+    print(f"   Thm A: violations {int(((Ep-Eij)>1e-9).sum())}/{nq}")
+    m1, l1, *_ = H.fuse_pair_math(zi[:5], zj[:5], lai[:5], laj[:5], bt)
+    m2, l2, *_ = H.fuse_pair_math(zi[:5], zj[:5], lai[:5] - 1.37, laj[:5] - 1.37, bt)
+    print(f"   Thm B: mu err {float((m1-m2).abs().max()):.1e}, ell err {float((l2-(l1-1.37)).abs().max()):.1e}")
+    print(f"   stable delta: err {float((delta-bq*omr).abs().max()):.1e}")
 
 
 if __name__ == "__main__":
