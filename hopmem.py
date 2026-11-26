@@ -4,9 +4,9 @@ evidence-monotone operations, an exact incremental Gram law, and the withdrawn
 superiority claim.
 
     python hopmem.py selftest        # 44 checks (spec section 24)
-    python hopmem.py calibrate --read gibbs
     python hopmem.py train --schedule probe --batch 256 --C 16 --c_min 4
     python hopmem_diag.py --ckpt hopmem_theta.pt --T_big 100 --caps 4 8 16 32 --dup_sweep
+    python hopmem_stats.py --ckpt hopmem_theta.pt --seeds 5 --T_big 100 500 1000
 
 State W=(1-S)J+M, tr W=1, W>=0, S in [0,1); <=C log-atoms (z, ell, Lam) + S + lazy clock.
 On overflow: (1) null-fuse gate-dead atoms (free, decision-free); (2) select the
@@ -21,9 +21,13 @@ Merge: mu=m/r, ell'=logaddexp-delta_fuse, Lam'=Lam_i+Lam_j+delta_fuse.
 Evict: delete the LIGHTER atom, heavier untouched, book delta_evict, mark destroyed.
 Ledger Lam is in NATS and tracks merge debits only; episode ledger sums both kinds;
 retained = exp(-Lam) if surviving, hard 0 if destroyed.
-Chain bound: ell_c >= logaddexp(base) - Lam_c (exact for one merge, conservative for chains).
-Gram: G_ik <- (w_i G_ik + w_j G_jk)/r from OLD rows, then G_ii <- 1, then zero row/col j.
-Crossover (equal mass): theta* = 2 arccos(1 - ln2/beta). No new parameters.
+
+POLICIES.  debit is canonical (Theorems A, B, E + reduction corollary).
+resfirst is an ABLATION: if any admissible pair is below the readout's own resolution
+scale, beta(1-G) <= 1, merge the cheapest such pair first; else fall back to debit.
+It preserves A, B and the spread-geometry reduction, but NOT Theorem E (it may pay
+more ledger nats than the cheapest eviction, by design, to avoid destroying provenance).
+ward reproduces v2.2.1 forced merging; lightest is streaming dose-ordered eviction.
 
 PARAMETERIZATION NOTE: eps_bar and chi are sigmoid-parameterized and must lie strictly
 in (0,1). The pure-write ablation is the flag pure_writes=True, NOT eps_bar=0.0.
@@ -43,6 +47,7 @@ EPS_R = 1e-3
 NEG = -1e30
 DOSE_FLOOR = 1e-30
 TINY = 1e-30
+POLICIES = ("debit", "resfirst", "ward", "lightest", "random", "delta")
 
 
 def inv_softplus(y):
@@ -165,12 +170,7 @@ def ward_log_cost(la, G, alive, eps_r=EPS_R):
 
 
 def debit_candidates(la, G, alive, beta, eps_r=EPS_R):
-    """Spec 4.5.  Returns (logDelta, is_fuse, d_fuse, d_evict, r, fuse_ok, valid).
-
-    logDelta = logaddexp(li,lj) - log S + log(min(d_fuse, d_evict)), +inf where masked.
-    is_fuse  = merge admissible (r>=eps_r) AND strictly cheaper than eviction.
-    Eviction is admissible for EVERY alive pair, so a candidate always exists.
-    """
+    """Spec 4.5.  Returns (logDelta, is_fuse, d_fuse, d_evict, r, fuse_ok, valid)."""
     li, lj = la.unsqueeze(2), la.unsqueeze(1)
     logA = torch.logaddexp(li, lj)
     w = torch.sigmoid(li - lj)
@@ -178,7 +178,7 @@ def debit_candidates(la, G, alive, beta, eps_r=EPS_R):
     t = 2.0 * w * (1.0 - w) * omg
     r = (1.0 - t).clamp_min(0.0).sqrt()
     d_fuse = beta * t / (1.0 + r)
-    d_evict = F.softplus(-(li - lj).abs())          # ln(1 + alpha_l/alpha_h), stable
+    d_evict = F.softplus(-(li - lj).abs())
     fuse_ok = r >= eps_r
     is_fuse = fuse_ok & (d_fuse < d_evict)
     d_min = torch.where(is_fuse, d_fuse, d_evict)
@@ -199,8 +199,7 @@ def _gath(x, idx):
 
 
 def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="debit"):
-    """Differentiable batched event loop: diffuse -> write -> compress-on-overflow.
-    policy: debit (v2.3.1) | ward (v2.2.1) | lightest | random | delta."""
+    """Differentiable batched event loop: diffuse -> write -> compress-on-overflow."""
     Z0, s, t, t_q = ep["Z"], ep["s"], ep["t"], ep["t_q"]
     B, T, d = Z0.shape
     dev, dtype = Z0.device, Z0.dtype
@@ -259,7 +258,7 @@ def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="debit"):
         alive = alive | F.one_hot(slot, K).bool()
         prov = prov | (F.one_hot(slot, K).bool()[..., None]
                        & F.one_hot(torch.full((B,), i, device=dev), T).bool()[:, None, :])
-        g_row = torch.einsum("bkd,bd->bk", Z, z_i)          # O(Cd) append row
+        g_row = torch.einsum("bkd,bd->bk", Z, z_i)
         G = G.scatter(1, slot[:, None, None].expand(B, 1, K), g_row[:, None, :])
         G = G.scatter(2, slot[:, None, None].expand(B, K, 1), g_row[:, :, None])
         t_prev = t[:, i]
@@ -287,6 +286,16 @@ def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="debit"):
                 logD = torch.where(valid & fuse_ok, lf,
                                    torch.where(valid, le, torch.full_like(lf, float("inf"))))
                 is_fuse = fuse_ok
+            elif policy == "resfirst":
+                # ABLATION: below-resolution pairs merge first (beta(1-G) <= 1).
+                S = la.exp().sum(-1).clamp_min(DOSE_FLOOR)
+                base = torch.logaddexp(la.unsqueeze(2), la.unsqueeze(1)) - S.log()[:, None, None]
+                lf = base + d_fuse.clamp_min(TINY).log()
+                res_ok = valid & fuse_ok & (beta * (1.0 - G).clamp_min(0.0) <= 1.0)
+                has_res = res_ok.reshape(B, K * K).any(1)
+                inf = torch.full_like(lf, float("inf"))
+                logD = torch.where(has_res[:, None, None], torch.where(res_ok, lf, inf), logD)
+                is_fuse = torch.where(has_res[:, None, None], res_ok, is_fuse)
             elif policy == "random":
                 rnd = torch.rand_like(logD)
                 logD = torch.where(valid, rnd, torch.full_like(rnd, float("inf")))
@@ -306,7 +315,7 @@ def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="debit"):
             mu, la_f, r_st, delta_f, w, Gij, omr, r_dir = fuse_pair_math(zi, zj, lai, laj, beta)
             Lami, Lamj = _gath(Lam, bi), _gath(Lam, bj)
             pi, pj = _gath(prov, bi), _gath(prov, bj)
-            vic = torch.where(lai < laj, bi, bj)        # lighter; ties -> bj
+            vic = torch.where(lai < laj, bi, bj)
             pv = _gath(prov, vic)
             lav = _gath(la, vic)
             destroyed = destroyed | (pv & e_sel[:, None])
@@ -322,7 +331,6 @@ def simulate_fusion(p, ep, C, tau_dead=1.0, eps_r=EPS_R, policy="debit"):
             prov = prov | (torch.where(f_sel[:, None], pi | pj, pi)[:, None, :]
                            & F.one_hot(bi, K).bool()[..., None])
 
-            # exact incremental Gram row (O(C), OLD rows), only where merging
             row = (w[:, None] * G[ar, bi, :] + (1.0 - w)[:, None] * G[ar, bj, :]) \
                 / r_dir.clamp_min(1e-12)[:, None]
             row = torch.where(f_sel[:, None], row, G[ar, bi, :])
@@ -390,7 +398,6 @@ class HopMem:
             return self.tau_dead
         return self.tau if self.tau is not None else 1.0
 
-    # ---- Gram law (spec 4.6) ----
     def _gram_append(self, z):
         n = len(self.atoms)
         if n == 1:
@@ -406,10 +413,10 @@ class HopMem:
         self.G = new
 
     def _gram_merge(self, i, j, w_i, w_j, r):
-        row = (w_i * self.G[i] + w_j * self.G[j]) / max(r, 1e-12)   # OLD rows
+        row = (w_i * self.G[i] + w_j * self.G[j]) / max(r, 1e-12)
         self.G[i] = row
         self.G[:, i] = row
-        self.G[i, i] = 1.0                                          # explicit guard
+        self.G[i, i] = 1.0
 
     def _gram_drop(self, j):
         n = self.G.shape[0]
@@ -421,7 +428,6 @@ class HopMem:
         self.G = self.G[idx][:, idx]
 
     def _rebuild_gram(self):
-        """Diagnostic only (drift refresh)."""
         if self.atoms:
             Zs = torch.stack([a["z"] for a in self.atoms])
             self.G = Zs @ Zs.t()
@@ -506,12 +512,22 @@ class HopMem:
                     vv, ff = valid[0], fuse_ok[0]
                     logD = torch.where(vv & ff, lfv,
                                        torch.where(vv, lev, torch.full_like(lfv, float("inf"))))[None]
+                elif self.policy == "resfirst":
+                    Sv = la.exp().sum().clamp_min(DOSE_FLOOR)
+                    basev = torch.logaddexp(la[:, None], la[None, :]) - Sv.log()
+                    lfv = basev + d_fuse[0].clamp_min(TINY).log()
+                    res_ok = valid[0] & fuse_ok[0] & (bt * (1.0 - self.G).clamp_min(0.0) <= 1.0)
+                    if bool(res_ok.any()):
+                        logD = torch.where(res_ok, lfv,
+                                           torch.full_like(lfv, float("inf")))[None]
+                        is_fuse = res_ok[None]
                 elif self.policy == "random":
                     logD = torch.where(valid, torch.rand_like(logD),
                                        torch.full_like(logD, float("inf")))
                 mn, idx = logD.reshape(1, n * n).min(1)
                 i, j = int(idx[0]) // n, int(idx[0]) % n
-                fuse = bool(is_fuse[0, i, j]) if self.policy == "debit" else bool(fuse_ok[0, i, j])
+                fuse = bool(is_fuse[0, i, j]) if self.policy in ("debit", "resfirst") \
+                    else bool(fuse_ok[0, i, j])
             if fuse:
                 ai, aj = self.atoms[i], self.atoms[j]
                 lai = torch.tensor([ai["la"]], dtype=self.dtype, device=self.device)
@@ -838,8 +854,7 @@ class EpisodeSampler:
 
 
 def dup_episodes(Zs, Qs, B, T, rho_dup, theta, lam=0.2, p_absent=0.2, device="cpu"):
-    """Spec 10 duplicate-heavy generator: with prob rho_dup the write is a near-copy
-    of the previous direction at angle ~theta."""
+    """Spec 10 duplicate-heavy generator."""
     P, d = len(Zs), Zs.shape[1]
     idx = torch.randint(P, (B, T), device=device)
     Z, Q = Zs[idx].clone(), Qs[idx].clone()
@@ -879,6 +894,38 @@ def sample_C(B, c_min, T, device="cpu"):
 
 
 # ----------------------------------------------------------------- evaluation
+@torch.no_grad()
+def gated_losses(p, ep, N=20, tau=None, C=None, tau_dead=None, policy="debit"):
+    """Per-episode deployed gated loss, for PAIRED statistics (spec 17.1/17.6).
+    Returns (loss[B], present_mask[B])."""
+    T = ep["Z"].shape[1]
+    sim = simulate_fusion(p, ep, T if C is None else C,
+                          tau_dead=(1.0 if tau_dead is None else tau_dead), policy=policy)
+    Z, la = sim["Z"], sim["la"]
+    u = read(Z, la, ep["q"], p, N)
+    gap = gate_gap(Z, la, ep["q"], p)
+    thr = math.log(tau if tau is not None else 1.0)
+    cos = lambda x, y: (x * y).sum(-1).abs().clamp(max=1.0)
+    loss = torch.where(gap > thr, 1 - cos(u, ep["z_t"]), 1 - cos(ep["q"], ep["z_t"]))
+    return loss, ep["tgt"] < T
+
+
+@torch.no_grad()
+def topk_losses(p, ep, C, score, N=20, tau=None):
+    """Per-episode gated loss for offline top-k eviction on a given score (baseline)."""
+    la = log_doses(p, ep["s"], ep["t"], ep["t_q"])
+    d = ep["Z"].shape[-1]
+    keep = score.topk(C, -1).indices
+    Zk = ep["Z"].gather(1, keep[..., None].expand(-1, -1, d))
+    lak = la.gather(1, keep)
+    u = read(Zk, lak, ep["q"], p, N)
+    gap = gate_gap(Zk, lak, ep["q"], p)
+    thr = math.log(tau if tau is not None else 1.0)
+    cos = lambda x, y: (x * y).sum(-1).abs().clamp(max=1.0)
+    loss = torch.where(gap > thr, 1 - cos(u, ep["z_t"]), 1 - cos(ep["q"], ep["z_t"]))
+    return loss, ep["tgt"] < ep["Z"].shape[1]
+
+
 @torch.no_grad()
 def evaluate(p, ep, N=20, auto_gamma=False, tau=None, C=None, tau_dead=None, policy="debit"):
     T = ep["Z"].shape[1]
@@ -1715,8 +1762,7 @@ def main():
             c.add_argument("--C", type=int, default=64)
             c.add_argument("--c_min", type=int, default=4)
             c.add_argument("--fuse", choices=["on", "off"], default="on")
-            c.add_argument("--fuse_policy", choices=["debit", "ward", "lightest", "random", "delta"],
-                           default="debit")
+            c.add_argument("--fuse_policy", choices=list(POLICIES), default="debit")
             c.add_argument("--out", default="hopmem_theta.pt")
     a = ap.parse_args()
     if a.cmd == "selftest":

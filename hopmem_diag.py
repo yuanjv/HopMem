@@ -3,8 +3,8 @@
 
  1 decomposed baselines (incl. kNN + train-fit threshold)
  2 cue-free prior CE vs oracle
- 3/4 capacity sweep: debit policy vs ward (v2.2.1) vs streaming-lightest vs offline top-k
- 5 duplicate-heavy sweep (spec 17.6 prediction ii)
+ 3/4 capacity sweep: debit / resfirst / ward / streaming-lightest vs offline top-k
+ 5 duplicate-heavy sweep (spec 17.6 prediction ii), now with resfirst
  6 unit theorem spot-checks
 """
 import argparse
@@ -108,13 +108,16 @@ def main():
     scores = {"learned": lag, "recency": g["t"], "random": torch.rand_like(lag),
               "oracle": torch.log(g["s"]) - lam * (g["t_q"][:, None] - g["t"])}
     print(f"\n3/4. capacity: T_big={a.T_big}, budget C")
-    print(f"   {'C':>4} {'policy':>16} {'present':>8} {'absent':>8} {'ret/kept':>8} {'ledger':>8} {'evict':>6}")
+    print(f"   {'C':>4} {'policy':>16} {'present':>8} {'absent':>8} {'ret/kept':>8} "
+          f"{'ledger':>8} {'merge':>6} {'evict':>6}")
     for C in a.caps:
-        for name, pp in (("DEBIT", "debit"), ("ward(v2.2.1)", "ward"), ("stream-lightest", "lightest")):
+        for name, pp in (("DEBIT", "debit"), ("resfirst", "resfirst"),
+                         ("ward(v2.2.1)", "ward"), ("stream-lightest", "lightest")):
             rf = H.evaluate(p, g, N, tau=tau, C=C, tau_dead=(tau if tau is not None else 1.0), policy=pp)
             print(f"   {C:>4} {name:>16} {rf.get('gate_pres',float('nan')):>8.4f} "
                   f"{rf.get('gate_abs',float('nan')):>8.4f} {rf.get('retained',float('nan')):>8.3f} "
-                  f"{rf.get('ledger',float('nan')):>8.3f} {rf.get('evict_n',float('nan')):>6.1f}")
+                  f"{rf.get('ledger',float('nan')):>8.3f} {rf.get('fuse_n',float('nan')):>6.1f} "
+                  f"{rf.get('evict_n',float('nan')):>6.1f}")
         for name, sc in scores.items():
             keep = sc.topk(C, -1).indices
             ret = (keep == g["tgt"][:, None]).any(-1)[pres].float().mean()
@@ -130,22 +133,27 @@ def main():
         th_star = 2 * math.acos(max(-1.0, 1 - math.log(2) / b_)) if b_ > math.log(2) / 2 else math.pi
         C = max(4, min(a.caps) if a.caps else 8)
         print(f"\n5. duplicate-heavy sweep (theta*={th_star:.3f}, copies at theta*/4), C={C}")
-        print(f"   {'rho_dup':>8} {'debit pres':>11} {'ward pres':>10} {'topk pres':>10} {'merges':>7}")
+        print(f"   {'rho_dup':>8} {'debit':>9} {'resfirst':>9} {'ward':>9} {'topk':>9} "
+              f"{'merges(debit)':>14} {'merges(resf)':>13}")
         for rd in (0.0, 0.25, 0.5, 0.75):
             epd = H.dup_episodes(Zs[cut:], Qs[cut:], 256, a.T_big, rd, th_star / 4,
                                  lam=lam, p_absent=pa, device=dev)
             prd = epd["tgt"] < a.T_big
-            rdeb = H.evaluate(p, epd, N, tau=tau, C=C, tau_dead=(tau or 1.0), policy="debit")
-            rward = H.evaluate(p, epd, N, tau=tau, C=C, tau_dead=(tau or 1.0), policy="ward")
+            rr = {}
+            for pp in ("debit", "resfirst", "ward"):
+                rr[pp] = H.evaluate(p, epd, N, tau=tau, C=C,
+                                    tau_dead=(tau or 1.0), policy=pp)
             lad = H.log_doses(p, epd["s"], epd["t"], epd["t_q"])
             keep = lad.topk(C, -1).indices
             Zk = epd["Z"].gather(1, keep[..., None].expand(-1, -1, d))
             lak = lad.gather(1, keep)
             u, gap = H.read(Zk, lak, epd["q"], p, N), H.gate_gap(Zk, lak, epd["q"], p)
             lg = torch.where(gap > thr, 1 - cosabs(u, epd["z_t"]), 1 - cosabs(epd["q"], epd["z_t"]))
-            print(f"   {rd:>8.2f} {rdeb.get('gate_pres',float('nan')):>11.4f} "
-                  f"{rward.get('gate_pres',float('nan')):>10.4f} {lg[prd].mean():>10.4f} "
-                  f"{rdeb.get('fuse_n',float('nan')):>7.1f}")
+            print(f"   {rd:>8.2f} {rr['debit'].get('gate_pres',float('nan')):>9.4f} "
+                  f"{rr['resfirst'].get('gate_pres',float('nan')):>9.4f} "
+                  f"{rr['ward'].get('gate_pres',float('nan')):>9.4f} {lg[prd].mean():>9.4f} "
+                  f"{rr['debit'].get('fuse_n',float('nan')):>14.1f} "
+                  f"{rr['resfirst'].get('fuse_n',float('nan')):>13.1f}")
 
     print("\n6. unit theorem spot-checks (float64)")
     dt = torch.float64
