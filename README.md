@@ -89,7 +89,7 @@ Lazy diffuse with an **absolute-time** clock: $\Delta t=\max(t-t_{\mathrm{clock}
 **Step 1.** Null-fuse all gate-dead atoms (free).
 
 **Step 2 — resolution gate.** For every alive unordered pair with $r^2=1-2w_iw_j(1-G_{ij})$, define
-$$\mathcal{R}=\big\{(i,j):\ r\ge\epsilon_r,\ \beta(1-G_{ij})\le1\big\}.$$
+$$\mathcal{R}=\left\{(i,j):\ r\ge\epsilon_r,\ \beta(1-G_{ij})\le1\right\}.$$
 If $\mathcal{R}\ne\emptyset$, **merge** $\arg\min_{\mathcal{R}}\Delta_{\mathrm{fuse}}$. Otherwise fall through.
 
 **Step 3 — debit argmin.** With
@@ -99,7 +99,7 @@ execute the winner. Since $1/S$ is constant per episode the argmin is over $A\,\
 
 **The two maps.** *fuse*: $\mu=m/r$, $\ell'=\mathrm{logaddexp}(\ell_i,\ell_j)-\delta_{\mathrm{fuse}}$, deficit $A(1-e^{-\delta})$ to $(1-S)J$, $\Lambda'=\Lambda_i+\Lambda_j+\delta_{\mathrm{fuse}}$, provenance unions. *evict*: delete $l$, $h$ untouched, book $\delta_{\mathrm{evict}}$, mark $l$'s provenance destroyed.
 
-**Debit semantics.** $\delta_{\mathrm{fuse}}$ is a *sufficient* uniform debit for Theorem A, tight at equal masses (binding at $u=\mu$), conservative otherwise. $\delta_{\mathrm{evict}}$ is the *exact* block log-dose reduction and the unique debit leaving the survivor's evidence identical; the smaller angle-dependent minimum $\ln\!\big(A/(\alpha_h+\alpha_le^{-\beta\sqrt{2(1-G)}})\big)$ inflates the survivor and is forbidden.
+**Debit semantics.** $\delta_{\mathrm{fuse}}$ is a *sufficient* uniform debit for Theorem A, tight at equal masses (binding at $u=\mu$), conservative otherwise. $\delta_{\mathrm{evict}}$ is the *exact* block log-dose reduction and the unique debit leaving the survivor's evidence identical; the smaller angle-dependent minimum $\ln\!\left(A/(\alpha_h+\alpha_le^{-\beta\sqrt{2(1-G)}})\right)$ inflates the survivor and is forbidden.
 
 **Two derived angles, no new constants.** $\theta_{\mathrm{gate}}=\arccos(1-1/\beta)\approx\sqrt{2/\beta}$; the debit branch's equal-mass crossover is $\theta^{*}=2\arccos(1-\ln2/\beta)$. At $\beta=20.70$: $\theta_{\mathrm{gate}}=0.312$, $\theta^{*}=0.519$. The gate is tighter at equal masses; its overrides occur for unequal masses whose pair is nonetheless unresolvable.
 
@@ -157,7 +157,7 @@ $$e^{\ell'+\beta\mu\cdot u}\le e^{\ell_i+\beta z_i\cdot u}+e^{\ell_j+\beta z_j\c
 **Theorem E′ (bounded forced debit).** Any gate-selected merge satisfies
 $$\delta_{\mathrm{fuse}}=\beta(1-r),\qquad 1-r=\frac{t}{1+r}\le t=2w_iw_j(1-G)\le\tfrac12(1-G),$$
 using $w_iw_j\le\tfrac14$; hence $\delta_{\mathrm{fuse}}\le\tfrac12\beta(1-G)\le\tfrac12$ **nat**. Sharper, from $t\le1/(2\beta)$:
-$$\delta_{\mathrm{fuse}}\le\beta\Big(1-\sqrt{1-\tfrac{1}{2\beta}}\Big)\xrightarrow[\beta\ \text{large}]{}\tfrac14 .$$
+$$\delta_{\mathrm{fuse}}\le\beta\left(1-\sqrt{1-\tfrac{1}{2\beta}}\right)\xrightarrow[\beta\ \text{large}]{}\tfrac14 .$$
 ∎ At $\beta=16$ the sharp bound is $0.251984$; measured maximum $0.251641$ over $2\times10^4$ gate-eligible draws. At the deployed $\beta=20.70$: bound $0.251529$, measured $0.251400$.
 
 **Corollary (bounded override).** Per overflow event, $\Delta_{\mathrm{canonical}}-\Delta_{\mathrm{debit}}\le\frac{A}{S}\delta_{\mathrm{fuse}}\le\tfrac12$ expected nat, since $A/S\le1$. The canonical policy pays at most half an expected nat more than the debit-optimal policy and preserves provenance that eviction destroys outright.
@@ -332,7 +332,7 @@ $C$ memory tokens, tied KV, log-dose attention biases, null token, gate as resid
 
 ---
 
-**End of spec v2.3.2 (measured results revised).** One gate, one comparison, zero new parameters: merge if $\beta(1-G)\le1$, else $\arg\min\frac{A}{S}\min\big(\beta(1-r),\mathrm{softplus}(\ell_l-\ell_h)\big)$. The override costs at most half a nat and buys back provenance; the ledger stays an audit, not an objective. The compression claim is now the best-supported result in the project; the readout claim is the least, and §19.5 says so.
+**End of spec v2.3.2 (measured results revised).** One gate, one comparison, zero new parameters: merge if $\beta(1-G)\le1$, else $\arg\min\frac{A}{S}\min\left(\beta(1-r),\mathrm{softplus}(\ell_l-\ell_h)\right)$. The override costs at most half a nat and buys back provenance; the ledger stays an audit, not an objective. The compression claim is now the best-supported result in the project; the readout claim is the least, and §19.5 says so.
 
 ---
 
