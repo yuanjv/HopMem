@@ -58,7 +58,7 @@ $W\succeq0$, $\mathrm{tr}\,W=1$, $S\in[0,1)$, $\lambda_{\min}(W)\ge(1-S)/d>0$ in
 
 ### 3.2 Canonical log-dose
 Between compressions,
-$$\ell_i(t_q)=\ln\big(a_i(1-\varepsilon_i)\big)-\omega\sum_{j>i}s_j-\Gamma(t_q-t_i),\quad a_i=1-e^{-\omega s_i},\ \varepsilon_i=\bar\varepsilon(1-a_i).$$
+$$\ell_i(t_q)=\ln\left(a_i(1-\varepsilon_i)\right)-\omega\sum_{j>i}s_j-\Gamma(t_q-t_i),\quad a_i=1-e^{-\omega s_i},\ \varepsilon_i=\bar\varepsilon(1-a_i).$$
 For a compressed block the **exact** dose is the recursion of §4.5. The closed form uses **per-constituent ages inside** the logaddexp, and
 $$\boxed{\;\ell_c\;\ge\;\mathrm{logaddexp}(\mathrm{base})-\Lambda_c\;}$$
 is **exact for one merge, conservative for chains**. *Proof of the chain step:* $\mathrm{logaddexp}(x-a,y-b)\ge\mathrm{logaddexp}(x,y)-\max(a,b)\ge\mathrm{logaddexp}(x,y)-(a+b)$ for $a,b\ge0$. ∎ Hence $e^{-\Lambda_c}$ is a **lower bound** on retained dose fraction. Measured: single-merge error $1.8\times10^{-15}$; chain slack $\le0.27$ nats over 300 random trees.
