@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""hopmem_diag.py v2.3.1 -- add-on for hopmem.py.
+"""hopmem_diag.py v2.3.2 -- add-on for hopmem.py.
 
  1 decomposed baselines (incl. kNN + train-fit threshold)
  2 cue-free prior CE vs oracle
- 3/4 capacity sweep: debit / resfirst / ward / streaming-lightest vs offline top-k
- 5 duplicate-heavy sweep (spec 17.6 prediction ii), now with resfirst
+ 3/4 capacity sweep: CANONICAL (resfirst) / debit / ward / streaming-lightest vs offline top-k
+ 5 duplicate-heavy sweep (spec 17.6), canonical vs debit vs ward vs top-k
  6 unit theorem spot-checks
 """
 import argparse
@@ -53,7 +53,7 @@ def main():
     p, tau, cfg = H.load_checkpoint(a.ckpt, dev)
     N, lam, pa = cfg.get("N", 20), cfg.get("query_decay", 0.2), cfg.get("p_absent", 0.2)
     thr = math.log(tau if tau is not None else 1.0)
-    pol = cfg.get("fuse_policy", "debit")
+    pol = cfg.get("fuse_policy", H.DEFAULT_POLICY)
     Zs, Qs, doc = H.synthetic_corpus(a) if a.synthetic else H.build_corpus(a)
     Zs, Qs = Zs.to(dev), Qs.to(dev)
     P = len(Zs)
@@ -111,7 +111,7 @@ def main():
     print(f"   {'C':>4} {'policy':>16} {'present':>8} {'absent':>8} {'ret/kept':>8} "
           f"{'ledger':>8} {'merge':>6} {'evict':>6}")
     for C in a.caps:
-        for name, pp in (("DEBIT", "debit"), ("resfirst", "resfirst"),
+        for name, pp in (("CANONICAL", "resfirst"), ("debit(ablation)", "debit"),
                          ("ward(v2.2.1)", "ward"), ("stream-lightest", "lightest")):
             rf = H.evaluate(p, g, N, tau=tau, C=C, tau_dead=(tau if tau is not None else 1.0), policy=pp)
             print(f"   {C:>4} {name:>16} {rf.get('gate_pres',float('nan')):>8.4f} "
@@ -133,14 +133,14 @@ def main():
         th_star = 2 * math.acos(max(-1.0, 1 - math.log(2) / b_)) if b_ > math.log(2) / 2 else math.pi
         C = max(4, min(a.caps) if a.caps else 8)
         print(f"\n5. duplicate-heavy sweep (theta*={th_star:.3f}, copies at theta*/4), C={C}")
-        print(f"   {'rho_dup':>8} {'debit':>9} {'resfirst':>9} {'ward':>9} {'topk':>9} "
-              f"{'merges(debit)':>14} {'merges(resf)':>13}")
+        print(f"   {'rho_dup':>8} {'canonical':>10} {'debit':>9} {'ward':>9} {'topk':>9} "
+              f"{'merges(canon)':>14} {'merges(debit)':>14}")
         for rd in (0.0, 0.25, 0.5, 0.75):
             epd = H.dup_episodes(Zs[cut:], Qs[cut:], 256, a.T_big, rd, th_star / 4,
                                  lam=lam, p_absent=pa, device=dev)
             prd = epd["tgt"] < a.T_big
             rr = {}
-            for pp in ("debit", "resfirst", "ward"):
+            for pp in ("resfirst", "debit", "ward"):
                 rr[pp] = H.evaluate(p, epd, N, tau=tau, C=C,
                                     tau_dead=(tau or 1.0), policy=pp)
             lad = H.log_doses(p, epd["s"], epd["t"], epd["t_q"])
@@ -149,11 +149,11 @@ def main():
             lak = lad.gather(1, keep)
             u, gap = H.read(Zk, lak, epd["q"], p, N), H.gate_gap(Zk, lak, epd["q"], p)
             lg = torch.where(gap > thr, 1 - cosabs(u, epd["z_t"]), 1 - cosabs(epd["q"], epd["z_t"]))
-            print(f"   {rd:>8.2f} {rr['debit'].get('gate_pres',float('nan')):>9.4f} "
-                  f"{rr['resfirst'].get('gate_pres',float('nan')):>9.4f} "
+            print(f"   {rd:>8.2f} {rr['resfirst'].get('gate_pres',float('nan')):>10.4f} "
+                  f"{rr['debit'].get('gate_pres',float('nan')):>9.4f} "
                   f"{rr['ward'].get('gate_pres',float('nan')):>9.4f} {lg[prd].mean():>9.4f} "
-                  f"{rr['debit'].get('fuse_n',float('nan')):>14.1f} "
-                  f"{rr['resfirst'].get('fuse_n',float('nan')):>13.1f}")
+                  f"{rr['resfirst'].get('fuse_n',float('nan')):>14.1f} "
+                  f"{rr['debit'].get('fuse_n',float('nan')):>14.1f}")
 
     print("\n6. unit theorem spot-checks (float64)")
     dt = torch.float64
@@ -172,6 +172,11 @@ def main():
     m2, l2, *_ = H.fuse_pair_math(zi[:5], zj[:5], lai[:5] - 1.37, laj[:5] - 1.37, bt)
     print(f"   Thm B: mu err {float((m1-m2).abs().max()):.1e}, ell err {float((l2-(l1-1.37)).abs().max()):.1e}")
     print(f"   stable delta: err {float((delta-bq*omr).abs().max()):.1e}")
+    u46 = torch.rand(20000, dtype=dt)
+    dl46, _, _ = H.resultant_deficit(torch.rand(20000, dtype=dt), u46 / bq, bt)
+    sharp = bq * (1.0 - math.sqrt(1.0 - 1.0 / (2.0 * bq)))
+    print(f"   Thm E' forced debit: max {float(dl46.max()):.6f} <= sharp {sharp:.6f} "
+          f"({bool((dl46 <= sharp + 1e-12).all())})")
 
 
 if __name__ == "__main__":

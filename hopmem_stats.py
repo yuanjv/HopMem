@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""hopmem_stats.py v2.3.1 -- paired multi-seed capacity statistics (spec 17.6).
+"""hopmem_stats.py v2.3.2 -- paired multi-seed capacity statistics (spec 17.6).
 
     python hopmem_stats.py --ckpt hopmem_theta.pt --same_passage \
         --seeds 5 --T_big 100 500 1000 --caps 4 8 16 --batch 256 --dup --ref topk-learned
     python hopmem_stats.py --ckpt hopmem_theta.pt --same_passage \
-        --seeds 5 --dup --ref debit          # decisive resfirst-vs-debit test
+        --seeds 5 --dup --dup_only --ref debit          # canonical-vs-debit test
 
 Every policy scores the SAME episode batch within a (T_big, C, seed) cell, so all
 differences are PAIRED per episode.  --ref is honored in BOTH the capacity and the
@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--T_big", type=int, nargs="+", default=[100, 500, 1000])
     ap.add_argument("--caps", type=int, nargs="+", default=[4, 8, 16])
     ap.add_argument("--batch", type=int, default=256)
-    ap.add_argument("--policies", nargs="+", default=["debit", "resfirst", "ward", "lightest"])
+    ap.add_argument("--policies", nargs="+", default=["resfirst", "debit", "ward", "lightest"])
     ap.add_argument("--ref", default="topk-learned")
     ap.add_argument("--dup", action="store_true")
     ap.add_argument("--dup_T", type=int, default=100)
